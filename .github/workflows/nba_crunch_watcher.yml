@@ -1,0 +1,51 @@
+name: NBA Crunch Watcher
+
+on:
+  schedule:
+    # 02:00 UTC = 10:00 AM SGT daily (exits in seconds on non-game days)
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Optional ESPN slate date (YYYYMMDD, US Eastern)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Print alerts to logs only (skip Telegram)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: nba-crunch-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run NBA Crunch Watcher
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-4-hydrogen"
+        run: |
+          ARGS="--ignore-wake-window --margin 10"
+          if [ -n "${{ inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ inputs.date }}"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python3 -u nba_crunch_watcher.py $ARGS
