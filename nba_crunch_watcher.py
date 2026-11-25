@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 NBA Crunch-Time & Lakers Watcher (Adaptive Polling + Optional Gemini Summaries)
-Monitors live NBA games via ESPN's public JSON APIs (pure Python 3.10+ stdlib).
+===============================================================================
+Monitors live NBA games using ESPN's public JSON scoreboard & game summary APIs
+(no external pip packages required; pure Python 3.10+ stdlib).
 """
 
 from __future__ import annotations
@@ -27,7 +29,10 @@ ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen"
-USER_AGENT = "NBACrunchWatcher/1.1 (+https://github.com/)"
+USER_AGENT = "NBACrunchWatcher/1.2 (+https://github.com/)"
+
+# Built-in Telegram topic target: "Sarah and Kelvin" supergroup -> "NBA" topic
+BUILTIN_TELEGRAM_TARGETS = ["-1002615344601:270"]
 
 LAKERS_ABBR = "LAL"
 CLOSE_MARGIN_DEFAULT = 10
@@ -170,11 +175,37 @@ class GeminiSummarizer:
             return fallback
 
 
+def parse_telegram_targets(raw_env: str, builtins: list[str]) -> list[tuple[str, int | None]]:
+    combined: list[str] = []
+    for item in [x.strip() for x in raw_env.split(",") if x.strip()] + list(builtins):
+        if item not in combined:
+            combined.append(item)
+    targets: list[tuple[str, int | None]] = []
+    for entry in combined:
+        if ":" in entry:
+            chat_id, thread_str = entry.split(":", 1)
+            try:
+                targets.append((chat_id.strip(), int(thread_str.strip())))
+            except ValueError:
+                targets.append((chat_id.strip(), None))
+        else:
+            targets.append((entry, None))
+    return targets
+
+
 class Notifier:
-    def __init__(self, dry_run: bool = False) -> None:
+    def __init__(
+        self,
+        dry_run: bool = False,
+        post_fn: Callable[[str, bytes, dict[str, str], int], bytes] = http_post,
+    ) -> None:
         self.dry_run = dry_run
+        self.post_fn = post_fn
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        self.tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.tg_targets = parse_telegram_targets(
+            os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            BUILTIN_TELEGRAM_TARGETS,
+        )
         self.discord_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
         self.ntfy_topic = os.getenv("NTFY_TOPIC", "").strip()
         self.ntfy_server = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
@@ -184,21 +215,38 @@ class Notifier:
         print("\n" + "=" * 60 + "\n" + full_msg + "\n" + "=" * 60 + "\n", flush=True)
         if self.dry_run:
             return
-        if self.tg_token and self.tg_chat:
-            try:
-                payload = json.dumps({"chat_id": self.tg_chat, "text": full_msg, "disable_web_page_preview": True}).encode("utf-8")
-                http_post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage", payload, {"Content-Type": "application/json", "User-Agent": USER_AGENT})
-            except Exception as exc:
-                log.error("Telegram send failed: %s", exc)
+        if self.tg_token and self.tg_targets:
+            for chat_id, thread_id in self.tg_targets:
+                try:
+                    msg_data: dict[str, Any] = {
+                        "chat_id": chat_id,
+                        "text": full_msg,
+                        "disable_web_page_preview": True,
+                    }
+                    if thread_id is not None:
+                        msg_data["message_thread_id"] = thread_id
+                    self.post_fn(
+                        f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
+                        json.dumps(msg_data).encode("utf-8"),
+                        {"Content-Type": "application/json", "User-Agent": USER_AGENT},
+                        20,
+                    )
+                except Exception as exc:
+                    log.error("Telegram send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
         if self.discord_url:
             try:
                 payload = json.dumps({"content": f"**{title}**\n{body}"[:1990]}).encode("utf-8")
-                http_post(self.discord_url, payload, {"Content-Type": "application/json", "User-Agent": USER_AGENT})
+                self.post_fn(self.discord_url, payload, {"Content-Type": "application/json", "User-Agent": USER_AGENT}, 20)
             except Exception as exc:
                 log.error("Discord send failed: %s", exc)
         if self.ntfy_topic:
             try:
-                http_post(f"{self.ntfy_server}/{urllib.parse.quote(self.ntfy_topic)}", body.encode("utf-8"), {"Title": title.encode("ascii", "ignore").decode("ascii") or "NBA Alert", "User-Agent": USER_AGENT})
+                self.post_fn(
+                    f"{self.ntfy_server}/{urllib.parse.quote(self.ntfy_topic)}",
+                    body.encode("utf-8"),
+                    {"Title": title.encode("ascii", "ignore").decode("ascii") or "NBA Alert", "User-Agent": USER_AGENT},
+                    20,
+                )
             except Exception as exc:
                 log.error("ntfy send failed: %s", exc)
 
