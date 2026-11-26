@@ -19,6 +19,11 @@ on:
         type: boolean
         required: false
         default: false
+      test_reddit:
+        description: "Dry-run test r/nba Game Thread access only"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: nba-crunch-watcher
@@ -54,5 +59,8 @@ jobs:
           fi
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ inputs.test_reddit }}" = "true" ]; then
+            ARGS="$ARGS --test-reddit"
           fi
           python3 -u nba_crunch_watcher.py $ARGS

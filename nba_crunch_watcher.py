@@ -399,6 +399,107 @@ class GeminiSummarizer:
         return fallback
 
 
+
+
+class RedditGameThreadWatcher:
+    """Best-effort, fail-silent r/nba Game Thread reader for non-boxscore viewer reactions."""
+
+    HOSTS = ("https://www.reddit.com", "https://old.reddit.com")
+    REDDIT_UA = "python:nba-clutch-time-bot:v3.1 (by /u/nbaclutchtimebot)"
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._thread_cache: dict[str, tuple[str | None, float]] = {}
+        self._blocked_until: float = 0.0
+
+    @staticmethod
+    def _nickname(team_name: str) -> str:
+        parts = team_name.strip().split()
+        if not parts:
+            return ""
+        if len(parts) >= 2 and parts[-2].lower() == "trail" and parts[-1].lower() == "blazers":
+            return "blazers"
+        return parts[-1].lower()
+
+    def _get_json(self, path: str, timeout: int = 8) -> Any:
+        now = time.time()
+        if now < self._blocked_until:
+            return None
+        for host in self.HOSTS:
+            url = f"{host}{path}"
+            req = urllib.request.Request(url, headers={"User-Agent": self.REDDIT_UA, "Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                log.info("Reddit %s returned HTTP %s on %s", host, exc.code, path.split("?")[0])
+                if exc.code in (403, 429):
+                    continue
+                return None
+            except Exception as exc:
+                log.info("Reddit fetch error on %s: %s", host, exc)
+                continue
+        # Both hosts blocked/failed — cool down 10 minutes so we never slow down ESPN polling
+        self._blocked_until = time.time() + 600
+        return None
+
+    def find_thread_id(self, game: GameSnapshot) -> str | None:
+        if not self.enabled:
+            return None
+        cached = self._thread_cache.get(game.game_id)
+        if cached is not None:
+            tid, ts = cached
+            if tid is not None or (time.time() - ts) < 900:
+                return tid
+        away_nick = self._nickname(game.away.name)
+        home_nick = self._nickname(game.home.name)
+        q = urllib.parse.quote(f'title:"Game Thread" {away_nick} {home_nick}')
+        data = self._get_json(f"/r/nba/search.json?q={q}&restrict_sr=1&sort=new&t=week&limit=10")
+        tid = None
+        if isinstance(data, dict):
+            for child in data.get("data", {}).get("children", []):
+                post = child.get("data") or {}
+                title_l = str(post.get("title", "")).lower()
+                if not title_l.startswith("game thread:"):
+                    continue
+                if away_nick in title_l and home_nick in title_l:
+                    tid = str(post.get("id", "")) or None
+                    if tid:
+                        log.info("Matched r/nba Game Thread for %s: %s (%s)", game.short_name, tid, post.get("title", ""))
+                        break
+        self._thread_cache[game.game_id] = (tid, time.time())
+        return tid
+
+    def fetch_recent_comments(self, game: GameSnapshot, window_seconds: int = 120, max_comments: int = 12) -> list[str]:
+        if not self.enabled:
+            return []
+        tid = self.find_thread_id(game)
+        if not tid:
+            return []
+        data = self._get_json(f"/r/nba/comments/{urllib.parse.quote(tid)}.json?sort=new&limit=30&depth=1")
+        if not isinstance(data, list) or len(data) < 2:
+            return []
+        now = time.time()
+        out: list[str] = []
+        for child in data[1].get("data", {}).get("children", []):
+            if child.get("kind") != "t1":
+                continue
+            c = child.get("data") or {}
+            author = str(c.get("author", ""))
+            if author in ("", "[deleted]", "AutoModerator"):
+                continue
+            body = " ".join(str(c.get("body", "")).split())
+            if len(body) < 15 or body in ("[deleted]", "[removed]"):
+                continue
+            created = float(c.get("created_utc", 0) or 0)
+            if window_seconds > 0 and (now - created) > window_seconds:
+                continue
+            out.append(body[:160])
+            if len(out) >= max_comments:
+                break
+        return out
+
+
 def parse_telegram_targets(raw_env: str, builtins: list[str], group_only: bool = True) -> list[tuple[str, int | None]]:
     combined: list[str] = []
     for item in [x.strip() for x in raw_env.split(",") if x.strip()] + list(builtins):
@@ -981,6 +1082,7 @@ def build_minute_update(
     summarizer: GeminiSummarizer | None = None,
     summary_fetcher: Callable[[str], dict[str, Any]] | None = None,
     sync_retry_delay: float = 8.0,
+    reddit_watcher: RedditGameThreadWatcher | None = None,
 ) -> tuple[str, str, int, float | None] | None:
     """Build a 1-minute crunch update using ALL new plays. Returns None if PBP lags a score jump."""
     def collect_all_plays(summ: dict[str, Any]) -> tuple[list[str], int]:
@@ -1037,6 +1139,10 @@ def build_minute_update(
         team_fouls,
         ("Personal Foul Trouble:\n" + "\n".join(f"- {f}" for f in foul_trouble)) if foul_trouble else "",
         "Complete Play Sequence in Last Minute (chronological):\n" + "\n".join(all_new_plays[-15:]),
+        (
+            "Live r/nba Viewer Reactions (ONLY mention if 2+ viewers flag the same concrete non-boxscore broadcast moment like an uncalled moving screen, controversial no-call, or injury; ignore memes/salt):\n"
+            + "\n".join(f"- {c}" for c in reddit_comments)
+        ) if (reddit_comments := (reddit_watcher.fetch_recent_comments(game) if reddit_watcher else [])) else "",
     ]))
     instruction = (
         "Tell the story of what happened in the last minute in 1–3 crisp • bullets (do NOT include the win-prob line or restate the header score/clock):\n"
@@ -1171,6 +1277,7 @@ def process_games(
     summary_fetcher=fetch_game_summary,
     summarizer: GeminiSummarizer | None = None,
     sync_retry_delay: float = 8.0,
+    reddit_watcher: RedditGameThreadWatcher | None = None,
 ) -> None:
     minute_batch: list[tuple[str, str]] = []
 
@@ -1202,7 +1309,7 @@ def process_games(
                 notifier.send(title, body, photo_bytes=banner)
                 tr.crunch_alerted, tr.last_play_seq, tr.last_home_win_pct = True, last_seq, home_wp
             elif tr.crunch_alerted:
-                res = build_minute_update(g, get_summary(), tr.last_play_seq, tr.last_home_win_pct, summarizer, summary_fetcher, sync_retry_delay)
+                res = build_minute_update(g, get_summary(), tr.last_play_seq, tr.last_home_win_pct, summarizer, summary_fetcher, sync_retry_delay, reddit_watcher=reddit_watcher)
                 if res is not None:
                     title, body, newest_seq, home_wp = res
                     minute_batch.append((title, body))
@@ -1222,9 +1329,29 @@ def process_games(
         notifier.send(digest_title, "\n\n".join(sections))
 
 
+def run_reddit_dry_run(date_yyyymmdd: str | None) -> None:
+    games = fetch_scoreboard(date_yyyymmdd or "20261125")
+    if not games:
+        log.info("No games found for Reddit dry run.")
+        return
+    target = next((g for g in games if g.away.abbr == "SA" or g.home.abbr == "SA"), games[-1])
+    log.info("Testing r/nba Game Thread lookup for %s (%s @ %s)...", target.short_name, target.away.name, target.home.name)
+    rw = RedditGameThreadWatcher(enabled=True)
+    tid = rw.find_thread_id(target)
+    log.info("Thread ID result: %s", tid)
+    comments = rw.fetch_recent_comments(target, window_seconds=0, max_comments=8)
+    log.info("Fetched %d sample comments:", len(comments))
+    for i, c in enumerate(comments, 1):
+        log.info("  [%d] %s", i, c)
+
+
 def run_watcher(args: argparse.Namespace) -> None:
+    if getattr(args, "test_reddit", False):
+        run_reddit_dry_run(args.date)
+        return
     notifier = Notifier(dry_run=args.dry_run)
     summarizer = GeminiSummarizer(model=args.gemini_model)
+    reddit_watcher = RedditGameThreadWatcher(enabled=not getattr(args, "no_reddit", False))
     trackers: dict[str, GameTracker] = {}
     while True:
         wake_wait = seconds_until_wake_window(dt.datetime.now(UTC).astimezone(SGT), args.wake_hour, args.ignore_wake_window)
@@ -1237,7 +1364,7 @@ def run_watcher(args: argparse.Namespace) -> None:
             log.error("Scoreboard fetch error: %s", exc)
             time.sleep(120)
             continue
-        process_games(games, trackers, notifier, close_margin=args.margin, summarizer=summarizer)
+        process_games(games, trackers, notifier, close_margin=args.margin, summarizer=summarizer, reddit_watcher=reddit_watcher)
         sleep_secs, reason = compute_next_sleep_seconds(games, trackers, dt.datetime.now(UTC), args.margin, args.wake_hour, args.ignore_wake_window)
         if sleep_secs <= 0:
             log.info("Done for the day (%s).", reason)
@@ -1254,6 +1381,8 @@ if __name__ == "__main__":
     p.add_argument("--ignore-wake-window", action="store_true")
     p.add_argument("--gemini-model", default=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-reddit", action="store_true")
+    p.add_argument("--test-reddit", action="store_true")
     try:
         run_watcher(p.parse_args())
     except KeyboardInterrupt:
