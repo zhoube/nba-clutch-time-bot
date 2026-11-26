@@ -2,9 +2,12 @@ name: NBA Crunch Watcher
 
 on:
   schedule:
-    # 02:00 UTC = 10:00 AM SGT daily (exits in seconds on non-game days)
-    - cron: "47 1 * * *"
-    - cron: "17 2 * * *"
+    # Early-slate window: 21:47 UTC = 05:47 AM SGT daily (catches 6:00 AM - 11:00 AM SGT tips)
+    - cron: "47 21 * * *"
+    # Late-slate handoff: 03:17 UTC = 11:17 AM SGT daily (picks up West Coast tips & OT after early job timeout)
+    - cron: "17 3 * * *"
+    # Weekend US matinee window: 17:17 UTC Sat/Sun = 01:17 AM SGT Sun/Mon
+    - cron: "17 17 * * 6,0"
   workflow_dispatch:
     inputs:
       date:
@@ -37,10 +40,10 @@ jobs:
 
       - name: Run NBA Crunch Watcher
         env:
-               TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-               TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-               GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-               GEMINI_MODEL: "gemini-4-hydrogen"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-4-hydrogen"
         run: |
           ARGS="--ignore-wake-window --margin 10"
           if [ -n "${{ inputs.date }}" ]; then
