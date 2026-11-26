@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NBA Crunch-Time & Lakers Watcher (Adaptive Polling + Optional Gemini Summaries)
-===============================================================================
+NBA Crunch-Time & Lakers Watcher (Adaptive Polling + Conversational Gemini Summaries)
+=====================================================================================
 Monitors live NBA games using ESPN's public JSON scoreboard & game summary APIs
 (no external pip packages required; pure Python 3.10+ stdlib).
 """
@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -29,7 +31,7 @@ ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen"
-USER_AGENT = "NBACrunchWatcher/1.2 (+https://github.com/)"
+USER_AGENT = "NBACrunchWatcher/2.0 (+https://github.com/)"
 
 # Built-in Telegram topic target: "Sarah and Kelvin" supergroup -> "NBA" topic
 BUILTIN_TELEGRAM_TARGETS = ["-1002615344601:270"]
@@ -53,6 +55,7 @@ class TeamSnapshot:
     name: str
     score: int
     linescores: list[int] = field(default_factory=list)
+    record: str = ""
 
 
 @dataclass
@@ -103,7 +106,7 @@ class GameSnapshot:
         )
 
     def score_line(self) -> str:
-        return f"{self.away.abbr} {self.away.score} - {self.home.score} {self.home.abbr}"
+        return f"{self.away.abbr} {self.away.score} – {self.home.score} {self.home.abbr}"
 
 
 @dataclass
@@ -134,6 +137,26 @@ def http_post(url: str, data: bytes, headers: dict[str, str], timeout: int = 20)
         return resp.read()
 
 
+def strip_html_tags(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def sanitize_telegram_html(text: str) -> str:
+    """Keep only Telegram-safe inline HTML tags (<b>, <i>, <code>) and escape stray <, >, &."""
+    # Convert accidental Markdown bold (**text**) into Telegram HTML <b>text</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # Temporarily shield allowed tags
+    placeholders: dict[str, str] = {}
+    for idx, tag in enumerate(("<b>", "</b>", "<i>", "</i>", "<code>", "</code>")):
+        token = f"__TG_TAG_{idx}__"
+        placeholders[token] = tag
+        text = text.replace(tag, token)
+    text = html.escape(text, quote=False)
+    for token, tag in placeholders.items():
+        text = text.replace(token, tag)
+    return text.strip()
+
+
 class GeminiSummarizer:
     def __init__(
         self,
@@ -149,35 +172,65 @@ class GeminiSummarizer:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
-    def summarize(self, instruction: str, raw_context: str, fallback: str) -> str:
+    def summarize(self, instruction: str, raw_context: str, fallback: str, max_tokens: int = 700) -> str:
         if not self.enabled:
             return fallback
-        url = f"{GEMINI_API_BASE}/{urllib.parse.quote(self.model)}:generateContent?key={urllib.parse.quote(self.api_key)}"
+        models_to_try = [self.model] + [
+            m for m in ("gemini-3.8-flash", "gemini-3.5-flash-lite") if m != self.model
+        ]
         prompt = (
-            f"{instruction}\n\n"
-            "Rules: Use ONLY the facts in the live data below. Do not invent stats, "
-            "players, or plays. Keep it concise, energetic, and easy to scan on a phone "
-            "(plain text, no markdown tables).\n\n"
+            "You are an NBA analyst writing crisp, readable live game updates for a Telegram group chat "
+            "(matching the clean, informative editorial style of a nightly NBA preview).\n\n"
+            f"TASK:\n{instruction}\n\n"
+            "STYLE & FORMATTING RULES:\n"
+            "- Keep the tone sharp, clear, and engaging—never overly casual, no greetings (no 'Yo', 'Hey', 'wake up', or addressing anyone by name), and no slang.\n"
+            "- Highlight the real basketball storylines in the data: momentum swings, comebacks, shooting efficiency or struggles, "
+            "standout stat lines or triple-double watches, and key recent possessions.\n"
+            "- Use ONLY the facts in LIVE DATA below—never invent players, stats, records, or plays.\n"
+            "- Format cleanly for Telegram using ONLY <b>bold</b>, <i>italic</i>, and • bullets. "
+            "No Markdown (** or #), no ASCII box tables, no walls of text.\n\n"
             f"LIVE DATA:\n{raw_context}"
         )
+        gen_cfg: dict[str, Any] = {
+            "temperature": 0.55,
+            "maxOutputTokens": max_tokens,
+        }
+        if "gemini-4" in self.model or "gemini-3" in self.model or "gemini-2.5" in self.model:
+            gen_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
+
         payload = json.dumps({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 260},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": gen_cfg,
         }).encode("utf-8")
-        try:
-            raw = self.post_fn(url, payload, {"Content-Type": "application/json", "User-Agent": USER_AGENT}, 20)
-            data = json.loads(raw.decode("utf-8"))
-            parts = data["candidates"][0]["content"]["parts"]
-            text = "".join(str(p.get("text", "")) for p in parts).strip()
-            return text or fallback
-        except Exception as exc:
-            log.warning("Gemini summary failed (%s) — using built-in template.", exc)
-            return fallback
+
+        last_exc: Exception | None = None
+        for model_name in models_to_try:
+            url = f"{GEMINI_API_BASE}/{urllib.parse.quote(model_name)}:generateContent?key={urllib.parse.quote(self.api_key)}"
+            try:
+                raw = self.post_fn(url, payload, {"Content-Type": "application/json", "User-Agent": USER_AGENT}, 35)
+                data = json.loads(raw.decode("utf-8"))
+                parts = data["candidates"][0]["content"]["parts"]
+                # Skip thought parts if returned separately
+                text = "".join(str(p.get("text", "")) for p in parts if not p.get("thought")).strip()
+                if text:
+                    return sanitize_telegram_html(text)
+            except Exception as exc:
+                last_exc = exc
+                err_s = str(exc).lower()
+                if any(code in err_s for code in ("429", "503", "404", "timed out")):
+                    log.info("Gemini model %s unavailable (%s); trying fallback model.", model_name, exc)
+                    continue
+                break
+        log.warning("Gemini summary failed (%s) — using built-in template.", last_exc)
+        return fallback
 
 
-def parse_telegram_targets(raw_env: str, builtins: list[str]) -> list[tuple[str, int | None]]:
+def parse_telegram_targets(raw_env: str, builtins: list[str], group_only: bool = True) -> list[tuple[str, int | None]]:
     combined: list[str] = []
     for item in [x.strip() for x in raw_env.split(",") if x.strip()] + list(builtins):
+        chat_part = item.split(":", 1)[0].strip()
+        if group_only and not chat_part.startswith("-"):
+            continue
         if item not in combined:
             combined.append(item)
     targets: list[tuple[str, int | None]] = []
@@ -201,7 +254,10 @@ class Notifier:
     ) -> None:
         self.dry_run = dry_run
         self.post_fn = post_fn
-        self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        raw_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().rstrip("/")
+        if raw_token.lower().startswith("bot") and ":" in raw_token:
+            raw_token = raw_token[3:]
+        self.tg_token = raw_token
         self.tg_targets = parse_telegram_targets(
             os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             BUILTIN_TELEGRAM_TARGETS,
@@ -211,31 +267,51 @@ class Notifier:
         self.ntfy_server = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
     def send(self, title: str, body: str) -> None:
-        full_msg = f"{title}\n{body}".strip()
-        print("\n" + "=" * 60 + "\n" + full_msg + "\n" + "=" * 60 + "\n", flush=True)
+        html_title = f"<b>{html.escape(title, quote=False)}</b>"
+        html_msg = f"{html_title}\n\n{body}".strip()
+        plain_msg = f"{title}\n\n{strip_html_tags(body)}".strip()
+        print("\n" + "=" * 60 + "\n" + plain_msg + "\n" + "=" * 60 + "\n", flush=True)
         if self.dry_run:
             return
         if self.tg_token and self.tg_targets:
             for chat_id, thread_id in self.tg_targets:
+                msg_data: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "text": html_msg,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }
+                if thread_id is not None:
+                    msg_data["message_thread_id"] = thread_id
                 try:
-                    msg_data: dict[str, Any] = {
-                        "chat_id": chat_id,
-                        "text": full_msg,
-                        "disable_web_page_preview": True,
-                    }
-                    if thread_id is not None:
-                        msg_data["message_thread_id"] = thread_id
                     self.post_fn(
                         f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
                         json.dumps(msg_data).encode("utf-8"),
                         {"Content-Type": "application/json", "User-Agent": USER_AGENT},
                         20,
                     )
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 400:
+                        # Fallback to plain text if HTML entity parsing ever fails
+                        msg_data.pop("parse_mode", None)
+                        msg_data["text"] = plain_msg
+                        try:
+                            self.post_fn(
+                                f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
+                                json.dumps(msg_data).encode("utf-8"),
+                                {"Content-Type": "application/json", "User-Agent": USER_AGENT},
+                                20,
+                            )
+                            continue
+                        except Exception as retry_exc:
+                            log.error("Telegram plain fallback failed for %s (thread=%s): %s", chat_id, thread_id, retry_exc)
+                            continue
+                    log.error("Telegram send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
                 except Exception as exc:
                     log.error("Telegram send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
         if self.discord_url:
             try:
-                payload = json.dumps({"content": f"**{title}**\n{body}"[:1990]}).encode("utf-8")
+                payload = json.dumps({"content": f"**{title}**\n{strip_html_tags(body)}"[:1990]}).encode("utf-8")
                 self.post_fn(self.discord_url, payload, {"Content-Type": "application/json", "User-Agent": USER_AGENT}, 20)
             except Exception as exc:
                 log.error("Discord send failed: %s", exc)
@@ -243,7 +319,7 @@ class Notifier:
             try:
                 self.post_fn(
                     f"{self.ntfy_server}/{urllib.parse.quote(self.ntfy_topic)}",
-                    body.encode("utf-8"),
+                    strip_html_tags(body).encode("utf-8"),
                     {"Title": title.encode("ascii", "ignore").decode("ascii") or "NBA Alert", "User-Agent": USER_AGENT},
                     20,
                 )
@@ -271,7 +347,16 @@ def parse_scoreboard(payload: dict[str, Any]) -> list[GameSnapshot]:
         for c in comp.get("competitors", []):
             t = c.get("team") or {}
             linescores = [int(float(ls.get("value", 0))) for ls in c.get("linescores", [])]
-            snap = TeamSnapshot(str(t.get("id", "")), str(t.get("abbreviation", "???")), str(t.get("displayName", "Unknown")), int(c.get("score", 0) or 0), linescores)
+            records = c.get("records") or []
+            rec_str = str(records[0].get("summary", "")) if records else ""
+            snap = TeamSnapshot(
+                str(t.get("id", "")),
+                str(t.get("abbreviation", "???")),
+                str(t.get("displayName", "Unknown")),
+                int(c.get("score", 0) or 0),
+                linescores,
+                rec_str,
+            )
             if c.get("homeAway") == "home":
                 home_team = snap
             else:
@@ -298,7 +383,7 @@ def fetch_game_summary(game_id: str) -> dict[str, Any]:
     return http_get_json(f"{ESPN_SUMMARY_URL}?event={game_id}")
 
 
-def extract_top_performers(summary: dict[str, Any], top_n: int = 2) -> dict[str, list[str]]:
+def extract_top_performers(summary: dict[str, Any], top_n: int = 3) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     for group in summary.get("boxscore", {}).get("players", []):
         abbr = group.get("team", {}).get("abbreviation", "???")
@@ -321,8 +406,11 @@ def extract_top_performers(summary: dict[str, Any], top_n: int = 2) -> dict[str,
                 ast = int(get_stat("AST"))
             except ValueError:
                 pts = reb = ast = 0
-            name = entry.get("athlete", {}).get("shortName") or entry.get("athlete", {}).get("displayName", "Player")
-            parsed.append((pts, reb + ast, f"{name}: {pts} PTS, {reb} REB, {ast} AST ({get_stat('FG')} FG)"))
+            name = entry.get("athlete", {}).get("displayName") or entry.get("athlete", {}).get("shortName", "Player")
+            fg = get_stat("FG")
+            tp = get_stat("3PT")
+            extra = f", {tp} 3PT" if tp and tp != "0-0" else ""
+            parsed.append((pts, reb + ast, f"{name}: {pts} PTS, {reb} REB, {ast} AST ({fg} FG{extra})"))
         parsed.sort(key=lambda x: (x[0], x[1]), reverse=True)
         result[abbr] = [p[2] for p in parsed[:top_n]]
     return result
@@ -340,48 +428,85 @@ def detect_comeback_and_run(game: GameSnapshot, summary: dict[str, Any]) -> list
         max_home_lead = max(max_home_lead, h - a)
     cur_diff = game.home.score - game.away.score
     if cur_diff >= -3 and max_away_lead >= 12:
-        notes.append(f"Comeback alert: {game.home.abbr} trailed by {max_away_lead} earlier.")
+        notes.append(f"Comeback alert: {game.home.name} trailed by as many as {max_away_lead} earlier.")
     if cur_diff <= 3 and max_home_lead >= 12:
-        notes.append(f"Comeback alert: {game.away.abbr} trailed by {max_home_lead} earlier.")
+        notes.append(f"Comeback alert: {game.away.name} trailed by as many as {max_home_lead} earlier.")
     recent = plays[-15:]
     if len(recent) >= 2:
         run_a = max(0, int(recent[-1].get("awayScore", 0) or 0) - int(recent[0].get("awayScore", 0) or 0))
         run_h = max(0, int(recent[-1].get("homeScore", 0) or 0) - int(recent[0].get("homeScore", 0) or 0))
         if run_a - run_h >= 8:
-            notes.append(f"Hot stretch: {game.away.abbr} on a {run_a}-{run_h} run.")
+            notes.append(f"Hot stretch: {game.away.name} on a {run_a}-{run_h} run.")
         elif run_h - run_a >= 8:
-            notes.append(f"Hot stretch: {game.home.abbr} on a {run_h}-{run_a} run.")
+            notes.append(f"Hot stretch: {game.home.name} on a {run_h}-{run_a} run.")
     return notes
 
 
-def format_linescore(game: GameSnapshot) -> str:
+def extract_recent_plays(summary: dict[str, Any], limit: int = 8) -> list[str]:
+    plays = summary.get("plays", [])
+    recent: list[str] = []
+    for p in plays[-20:]:
+        text = str(p.get("text", "")).strip()
+        if not text:
+            continue
+        is_scoring = bool(p.get("scoringPlay"))
+        if is_scoring or any(k in text.lower() for k in ("steal", "block", "turnover", "timeout", "foul", "challenge")):
+            clock = p.get("clock", {}).get("displayValue", "")
+            qtr = p.get("period", {}).get("number", "")
+            score_tag = f" ({p.get('awayScore')}-{p.get('homeScore')})" if is_scoring else ""
+            recent.append(f"[Q{qtr} {clock}] {text}{score_tag}")
+    return recent[-limit:]
+
+
+def format_linescore_compact(game: GameSnapshot) -> str:
     if not game.away.linescores or not game.home.linescores:
         return ""
-    quarters = [f"Q{i+1}" if i < 4 else f"OT{i-3}" for i in range(max(len(game.away.linescores), len(game.home.linescores)))]
-    header = "       " + " ".join(f"{q:>3}" for q in quarters) + " | TOT"
-    away_row = f"{game.away.abbr:<5}: " + " ".join(f"{s:>3}" for s in game.away.linescores) + f" | {game.away.score:>3}"
-    home_row = f"{game.home.abbr:<5}: " + " ".join(f"{s:>3}" for s in game.home.linescores) + f" | {game.home.score:>3}"
-    return f"{header}\n{away_row}\n{home_row}"
+    a_str = "-".join(str(s) for s in game.away.linescores)
+    h_str = "-".join(str(s) for s in game.home.linescores)
+    return f"{game.away.abbr} ({a_str} = {game.away.score}) | {game.home.abbr} ({h_str} = {game.home.score})"
 
 
 def build_crunch_intro(game: GameSnapshot, summary: dict[str, Any], summarizer: GeminiSummarizer | None = None) -> tuple[str, str, int]:
     period_lbl = f"Q{game.period}" if game.period <= 4 else f"OT{game.period - 4}"
-    title = f"CLOSE GAME ({period_lbl} {game.display_clock}): {game.score_line()}"
-    lines = [ls] if (ls := format_linescore(game)) else []
+    title = f"🏀 Crunch Time ({period_lbl} {game.display_clock}) — {game.score_line()}"
+    ls_compact = format_linescore_compact(game)
     story_notes = detect_comeback_and_run(game, summary)
+    performers = extract_top_performers(summary, top_n=3)
+    recent_plays = extract_recent_plays(summary, limit=8)
+
+    fallback_lines = []
+    if ls_compact:
+        fallback_lines.append(f"<b>Quarters:</b> {html.escape(ls_compact)}")
     if story_notes:
-        lines.extend([""] + story_notes)
-    performers = extract_top_performers(summary, top_n=2)
+        fallback_lines.extend(f"• {html.escape(n)}" for n in story_notes)
     if performers:
-        lines.append("\nTop performers:")
+        fallback_lines.append("\n<b>Top performers:</b>")
         for abbr in (game.away.abbr, game.home.abbr):
-            lines.extend(f"  - [{abbr}] {p}" for p in performers.get(abbr, []))
-    fallback_body = "\n".join(lines)
-    body = summarizer.summarize(
-        "Write a punchy 3-4 sentence crunch-time alert telling a basketball fan why to tune into this close 4th-quarter/OT game right now: highlight the current score & clock, who is having a big game, and any comeback or hot run.",
-        f"Game: {game.short_name} ({period_lbl} {game.display_clock})\n{fallback_body}",
-        fallback_body,
-    ) if (summarizer and summarizer.enabled) else fallback_body
+            fallback_lines.extend(f"• [{abbr}] {html.escape(p)}" for p in performers.get(abbr, [])[:2])
+    fallback_body = "\n".join(fallback_lines)
+
+    away_lbl = f"{game.away.name} ({game.away.record})" if game.away.record else game.away.name
+    home_lbl = f"{game.home.name} ({game.home.record})" if game.home.record else game.home.name
+    raw_context_parts = [
+        f"Matchup: {away_lbl} @ {home_lbl}",
+        f"Current Score & Clock: {game.away.abbr} {game.away.score}, {game.home.abbr} {game.home.score} ({period_lbl} {game.display_clock})",
+        f"Quarter-by-quarter: {ls_compact}" if ls_compact else "",
+        "Comeback / Run Notes:\n" + "\n".join(f"- {n}" for n in story_notes) if story_notes else "Comeback / Run Notes: None flagged",
+        "Top Performers:\n"
+        + "\n".join(
+            f"- {abbr}: " + " | ".join(performers.get(abbr, []))
+            for abbr in (game.away.abbr, game.home.abbr)
+        ),
+        "Most Recent Key Plays:\n" + "\n".join(f"- {rp}" for rp in recent_plays) if recent_plays else "",
+    ]
+    raw_context = "\n\n".join(p for p in raw_context_parts if p)
+
+    instruction = (
+        "Write a clean, easy-to-scan crunch-time update for this close game:\n"
+        "1. Lead directly with a compact <b>Quarter flow:</b> line (no greeting or hype intro).\n"
+        "2. Add 3–4 crisp • bullets covering the game's momentum/comeback context, who's driving each side (notable efficiency, shooting struggles, or triple-double watches), and what happened on the most recent possessions."
+    )
+    body = summarizer.summarize(instruction, raw_context, fallback_body) if (summarizer and summarizer.enabled) else fallback_body
     plays = summary.get("plays", [])
     return title, body, int(plays[-1].get("sequenceNumber", len(plays))) if plays else 0
 
@@ -395,7 +520,8 @@ def build_minute_update(game: GameSnapshot, summary: dict[str, Any], last_seq: i
             new_plays.append(p)
             newest_seq = max(newest_seq, seq)
     period_lbl = "FINAL" if game.is_final else (f"Q{game.period} {game.display_clock}" if game.period <= 4 else f"OT{game.period - 4} {game.display_clock}")
-    title = f"{game.score_line()} ({period_lbl})"
+    prefix = "🏁 Final" if game.is_final else f"⏱ {period_lbl}"
+    title = f"{prefix} — {game.score_line()}"
     highlights = []
     for p in new_plays:
         text = str(p.get("text", "")).strip()
@@ -407,31 +533,62 @@ def build_minute_update(game: GameSnapshot, summary: dict[str, Any], last_seq: i
             score_tag = f" ({p.get('awayScore')}-{p.get('homeScore')})" if is_scoring else ""
             highlights.append(f"[{clock}] {text}{score_tag}")
     if not highlights:
-        return title, "No scoring or major plays in the last minute (timeout / stoppage / missed shots).", newest_seq
-    fallback_body = "Last minute:\n" + "\n".join(highlights[-8:])
-    body = summarizer.summarize(
-        "Summarize what happened in the previous minute of this close NBA game in 2-3 ultra-short bullet lines (who scored, key defensive plays/turnovers, and the current score/momentum).",
-        f"Score: {game.score_line()} ({period_lbl})\n{fallback_body}",
-        fallback_body,
-    ) if (summarizer and summarizer.enabled) else fallback_body
+        return title, "<i>Quiet minute — timeout, stoppage, or empty trips on both ends.</i>", newest_seq
+    fallback_body = "<b>Last minute:</b>\n" + "\n".join(f"• {html.escape(h)}" for h in highlights[-8:])
+    if game.is_final:
+        performers = extract_top_performers(summary, top_n=2)
+        perf_ctx = "\n".join(
+            f"- {abbr}: " + " | ".join(performers.get(abbr, []))
+            for abbr in (game.away.abbr, game.home.abbr)
+        )
+        instruction = (
+            "Write a brisk, conversational final-buzzer wrap-up (2–3 short sentences + 2 bullets): "
+            "how the closing minute sealed it, who closed the game out, and the top stat line."
+        )
+        raw_context = f"Final: {game.away.name} {game.away.score}, {game.home.name} {game.home.score}\nClosing plays:\n" + "\n".join(highlights[-8:]) + f"\n\nTop performers:\n{perf_ctx}"
+    else:
+        instruction = (
+            "Summarize the last minute of this close game in 2–3 crisp • bullets covering who scored, "
+            "any key stops, turnovers, fouls, or timeouts, and the current momentum."
+        )
+        raw_context = f"Score: {game.away.name} {game.away.score}, {game.home.name} {game.home.score} ({period_lbl})\nPlays in last minute:\n" + "\n".join(highlights[-8:])
+    body = summarizer.summarize(instruction, raw_context, fallback_body, max_tokens=450) if (summarizer and summarizer.enabled) else fallback_body
     return title, body, newest_seq
 
 
 def build_lakers_quarter_update(game: GameSnapshot, summary: dict[str, Any], period_done: int, summarizer: GeminiSummarizer | None = None) -> tuple[str, str]:
-    label = "FINAL" if game.is_final else ("HALFTIME" if period_done == 2 else (f"END OF Q{period_done}" if period_done <= 4 else f"END OF OT{period_done - 4}"))
-    title = f"LAKERS {label}: {game.score_line()}"
-    lines = [ls] if (ls := format_linescore(game)) else []
-    performers = extract_top_performers(summary, top_n=2)
+    label = "Final" if game.is_final else ("Halftime" if period_done == 2 else (f"End of Q{period_done}" if period_done <= 4 else f"End of OT{period_done - 4}"))
+    title = f"💜💛 Lakers {label} — {game.score_line()}"
+    ls_compact = format_linescore_compact(game)
+    performers = extract_top_performers(summary, top_n=3)
+    story_notes = detect_comeback_and_run(game, summary)
+
+    fallback_lines = []
+    if ls_compact:
+        fallback_lines.append(f"<b>Quarters:</b> {html.escape(ls_compact)}")
     if performers:
-        lines.append("\nLeaders:")
+        fallback_lines.append("\n<b>Leaders:</b>")
         for abbr in (game.away.abbr, game.home.abbr):
-            lines.extend(f"  - [{abbr}] {p}" for p in performers.get(abbr, []))
-    fallback_body = "\n".join(lines)
-    body = summarizer.summarize(
-        f"Write a crisp 2-3 sentence {label} recap for a Los Angeles Lakers fan: state how the Lakers are doing, who is leading for both teams, and the quarter trend.",
-        f"Game: {game.short_name} ({label})\n{fallback_body}",
-        fallback_body,
-    ) if (summarizer and summarizer.enabled) else fallback_body
+            fallback_lines.extend(f"• [{abbr}] {html.escape(p)}" for p in performers.get(abbr, [])[:2])
+    fallback_body = "\n".join(fallback_lines)
+
+    raw_context = "\n\n".join(filter(None, [
+        f"Game: {game.away.name} @ {game.home.name} ({label})",
+        f"Score: {game.score_line()}",
+        f"Quarter-by-quarter: {ls_compact}" if ls_compact else "",
+        "Runs / Comebacks:\n" + "\n".join(f"- {n}" for n in story_notes) if story_notes else "",
+        "Top Performers:\n" + "\n".join(
+            f"- {abbr}: " + " | ".join(performers.get(abbr, []))
+            for abbr in (game.away.abbr, game.home.abbr)
+        ),
+    ]))
+    instruction = (
+        f"Write a sharp, conversational {label} check-in for a Lakers fan:\n"
+        "1. 1–2 sentences on how the Lakers look right now and the quarter's momentum.\n"
+        "2. Compact <b>Quarters:</b> line.\n"
+        "3. 2–3 crisp • bullets on who's carrying LA, who's hurting them on the other side, and what to watch next."
+    )
+    body = summarizer.summarize(instruction, raw_context, fallback_body) if (summarizer and summarizer.enabled) else fallback_body
     return title, body
 
 
