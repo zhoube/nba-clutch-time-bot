@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-NBA Crunch-Time & Lakers Watcher (Adaptive Polling + Gemini Editorial Summaries + Team-Logo Banners)
-====================================================================================================
+NBA Crunch-Time & Lakers Watcher (Adaptive Polling + Beat-Writer Gemini Summaries + Win Prob + Logos)
+=====================================================================================================
 Monitors live NBA games using ESPN's public JSON scoreboard & game summary APIs.
-Uses Pillow (optional) to render real ESPN team-logo matchup banners on initial crunch-time alerts
-and Lakers end-of-quarter recaps; gracefully falls back to text-only if Pillow is unavailable.
+Includes ESPN Analytics live Win Probability, personal foul-trouble & team bonus tracking,
+unfiltered minute-by-minute play-by-play with [TEAM] tags, combined multi-game digests,
+and real ESPN team-logo matchup banners via Pillow (optional; falls back to text-only).
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen"
-USER_AGENT = "NBACrunchWatcher/2.2 (+https://github.com/)"
+USER_AGENT = "NBACrunchWatcher/3.0 (+https://github.com/)"
 
 # Built-in Telegram topic target: "Sarah and Kelvin" supergroup -> "NBA" topic
 BUILTIN_TELEGRAM_TARGETS = ["-1002615344601:270"]
@@ -139,6 +140,15 @@ class GameSnapshot:
             return f"{team_badge(self.away.abbr)} {self.away.abbr} {self.away.score} – {self.home.score} {self.home.abbr} {team_badge(self.home.abbr)}"
         return f"{self.away.abbr} {self.away.score} – {self.home.score} {self.home.abbr}"
 
+    def lead_summary(self) -> str:
+        if self.away.score == self.home.score:
+            return f"Tied {self.away.score}-{self.home.score}"
+        leader = self.home if self.home.score > self.away.score else self.away
+        diff = self.margin
+        poss = (diff + 2) // 3
+        poss_lbl = "1-possession game" if poss == 1 else f"{poss}-possession game"
+        return f"{leader.name} ({leader.abbr}) lead by {diff} ({poss_lbl})"
+
 
 @dataclass
 class GameTracker:
@@ -147,6 +157,7 @@ class GameTracker:
     last_play_seq: int = 0
     last_lakers_period_sent: int = 0
     lakers_final_sent: bool = False
+    last_home_win_pct: float | None = None
 
 
 def http_get_bytes(url: str, timeout: int = 15, retries: int = 2) -> bytes:
@@ -232,23 +243,21 @@ def _load_font(size: int, bold: bool = True) -> Any:
     return ImageFont.load_default()
 
 
-def render_matchup_banner(game: GameSnapshot, status_badge: str) -> bytes | None:
+def render_matchup_banner(game: GameSnapshot, status_badge: str, win_prob_note: str = "") -> bytes | None:
     """Render a 900x320 broadcast-style matchup banner with real ESPN team PNG logos."""
     if Image is None or ImageDraw is None:
         return None
     try:
         w, h = 900, 320
-        bg = (15, 23, 42)  # dark slate
+        bg = (15, 23, 42)
         img = Image.new("RGBA", (w, h), bg + (255,))
         draw = ImageDraw.Draw(img)
 
         away_col = _parse_hex_color(game.away.color_hex, (59, 130, 246))
         home_col = _parse_hex_color(game.home.color_hex, (239, 68, 68))
 
-        # Top team-color accent bars
         draw.rectangle([0, 0, w // 2, 10], fill=away_col + (255,))
         draw.rectangle([w // 2, 0, w, 10], fill=home_col + (255,))
-        # Subtle card divider
         draw.rounded_rectangle([24, 26, w - 24, h - 24], radius=22, fill=(24, 34, 58, 255), outline=(51, 65, 85, 255), width=2)
 
         def fetch_logo(team: TeamSnapshot) -> Any:
@@ -261,7 +270,6 @@ def render_matchup_banner(game: GameSnapshot, status_badge: str) -> bytes | None
         away_logo = fetch_logo(game.away)
         home_logo = fetch_logo(game.home)
 
-        # Paste logos left and right
         img.alpha_composite(away_logo, (68 + (148 - away_logo.width) // 2, 54 + (148 - away_logo.height) // 2))
         img.alpha_composite(home_logo, (w - 68 - 148 + (148 - home_logo.width) // 2, 54 + (148 - home_logo.height) // 2))
 
@@ -270,7 +278,6 @@ def render_matchup_banner(game: GameSnapshot, status_badge: str) -> bytes | None
         f_rec = _load_font(18, bold=False)
         f_badge = _load_font(22, bold=True)
 
-        # Team abbreviations & records beneath logos
         draw.text((142, 222), game.away.abbr, fill=(248, 250, 252), font=f_abbr, anchor="mm")
         if game.away.record:
             draw.text((142, 252), game.away.record, fill=(148, 163, 184), font=f_rec, anchor="mm")
@@ -279,21 +286,19 @@ def render_matchup_banner(game: GameSnapshot, status_badge: str) -> bytes | None
         if game.home.record:
             draw.text((w - 142, 252), game.home.record, fill=(148, 163, 184), font=f_rec, anchor="mm")
 
-        # Center status pill
         pill_text = status_badge.upper()
         pill_w = max(180, len(pill_text) * 14 + 44)
         px1, px2 = (w - pill_w) // 2, (w + pill_w) // 2
-        draw.rounded_rectangle([px1, 56, px2, 98], radius=21, fill=(220, 38, 38, 255))
-        draw.text((w // 2, 77), pill_text, fill=(255, 255, 255), font=f_badge, anchor="mm")
+        pill_fill = (22, 163, 74, 255) if "FINAL" in pill_text else (220, 38, 38, 255)
+        draw.rounded_rectangle([px1, 54, px2, 96], radius=21, fill=pill_fill)
+        draw.text((w // 2, 75), pill_text, fill=(255, 255, 255), font=f_badge, anchor="mm")
 
-        # Center scoreline
         score_text = f"{game.away.score}  –  {game.home.score}"
-        draw.text((w // 2, 166), score_text, fill=(255, 255, 255), font=f_score, anchor="mm")
+        draw.text((w // 2, 162), score_text, fill=(255, 255, 255), font=f_score, anchor="mm")
 
-        # Quarter-by-quarter footer strip inside card
-        ls = format_linescore_compact(game)
-        if ls:
-            draw.text((w // 2, 252), ls, fill=(203, 213, 225), font=f_rec, anchor="mm")
+        footer = win_prob_note or format_linescore_compact(game)
+        if footer:
+            draw.text((w // 2, 252), footer, fill=(203, 213, 225), font=f_rec, anchor="mm")
 
         out = io.BytesIO()
         img.convert("RGB").save(out, format="PNG", optimize=True)
@@ -336,27 +341,33 @@ class GeminiSummarizer:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
-    def summarize(self, instruction: str, raw_context: str, fallback: str, max_tokens: int = 700) -> str:
+    def summarize(self, instruction: str, raw_context: str, fallback: str, max_tokens: int = 750) -> str:
         if not self.enabled:
             return fallback
         models_to_try = [self.model] + [
             m for m in ("gemini-3.8-flash", "gemini-3.5-flash-lite") if m != self.model
         ]
         prompt = (
-            "You are an NBA analyst writing crisp, readable live game updates for a Telegram group chat "
-            "(matching the clean, informative editorial style of a nightly NBA preview).\n\n"
+            "You are a sharp NBA beat writer / League Pass play-by-play analyst writing live game updates for a Telegram group chat.\n\n"
             f"TASK:\n{instruction}\n\n"
-            "STYLE & FORMATTING RULES:\n"
-            "- Keep the tone sharp, clear, and engaging—never overly casual, no greetings (no 'Yo', 'Hey', 'wake up', or addressing anyone by name), and no slang.\n"
-            "- Highlight the real basketball storylines in the data: momentum swings, comebacks, shooting efficiency or struggles, "
-            "standout stat lines or triple-double watches, and key recent possessions.\n"
-            "- Use ONLY the facts in LIVE DATA below—never invent players, stats, records, or plays.\n"
-            "- Format cleanly for Telegram using ONLY <b>bold</b>, <i>italic</i>, and • bullets. "
-            "No Markdown (** or #), no ASCII box tables, no walls of text.\n\n"
+            "VOICE, BASKETBALL IQ & FORMATTING RULES:\n"
+            "- Write like an informed NBA beat writer—punchy, vivid, and natural. Use earned basketball terms and iconic NBA flavor "
+            "when the play genuinely warrants it (e.g. 'Dame Time' on a clutch Damian Lillard three, 'And-1', 'dagger', 'in the bonus', 'foul trouble'), "
+            "without greetings ('Yo', 'Hey'), bro-talk, or hype-bot spam.\n"
+            "- MERGE linked plays into one clean bullet (e.g., a made layup + shooting foul at the same timestamp = one And-1 bullet; "
+            "a shooting foul + the resulting free throws = one bullet; a steal + transition bucket = one bullet).\n"
+            "- NEVER restate the header score or clock as a separate filler bullet, and NEVER overuse 'momentum'—only mention momentum on an actual run, lead change, or comeback surge.\n"
+            "- BANNED clichés: 'Late-game battle', 'Trailing [Team]', 'Momentum check', 'Momentum & strategy', 'execution down the stretch', 'tightly contested stretch', 'crucial stoppage'.\n"
+            "- ALWAYS call out personal foul trouble (Q1 ≥2, Q2 ≥3, Q3 ≥4, Q4/OT ≥5 PF) and team bonus situations when flagged in LIVE DATA.\n"
+            "- Use ONLY facts from LIVE DATA (pay strict attention to [TEAM] tags and lead margin—never mix up which team scored or miscount possessions).\n"
+            "- Format cleanly for Telegram using ONLY <b>bold</b>, <i>italic</i>, <code>code</code>, and • bullets. Use consistent <b>bold</b> lead-ins (no random italics for labels). No Markdown (** or #).\n\n"
+            "GOOD EXAMPLES OF STYLE:\n"
+            "• <b>Wemby And-1 & Clingan foul trouble:</b> Victor Wembanyama powers through Donovan Clingan for an And-1 layup to cut it to 96–91 — that's Clingan's 5th foul, putting him one away from fouling out.\n"
+            "• <b>Dame Time:</b> Damian Lillard drills a 26-foot three off a Jrue Holiday feed to stretch Portland's lead to 104–102.\n\n"
             f"LIVE DATA:\n{raw_context}"
         )
         gen_cfg: dict[str, Any] = {
-            "temperature": 0.55,
+            "temperature": 0.65,
             "maxOutputTokens": max_tokens,
         }
         if "gemini-4" in self.model or "gemini-3" in self.model or "gemini-2.5" in self.model:
@@ -515,7 +526,6 @@ class Notifier:
                         if not ok:
                             self._send_tg_text(chat_id, thread_id, html_msg, plain_msg)
                     else:
-                        # Caption exceeds Telegram's 1024-char limit: send banner + full text right below
                         self._send_tg_photo(chat_id, thread_id, photo_bytes, html_title, title)
                         self._send_tg_text(chat_id, thread_id, body, strip_html_tags(body))
                 else:
@@ -596,6 +606,143 @@ def fetch_game_summary(game_id: str) -> dict[str, Any]:
     return http_get_json(f"{ESPN_SUMMARY_URL}?event={game_id}")
 
 
+def extract_win_probability(
+    game: GameSnapshot,
+    summary: dict[str, Any],
+    prev_home_pct: float | None = None,
+) -> tuple[float | None, str, str]:
+    """Return (home_pct, html_line, plain_banner_note) from ESPN Analytics winprobability."""
+    wp = summary.get("winprobability") or []
+    if not wp:
+        return None, "", ""
+    try:
+        home_pct = float(wp[-1].get("homeWinPercentage", 0.5))
+    except (TypeError, ValueError):
+        return None, "", ""
+    away_pct = max(0.0, min(1.0, 1.0 - home_pct))
+    h_int = round(home_pct * 100)
+    a_int = 100 - h_int
+
+    delta_str = ""
+    if prev_home_pct is not None:
+        if home_pct >= away_pct:
+            diff = round((home_pct - prev_home_pct) * 100)
+        else:
+            diff = round((away_pct - (1.0 - prev_home_pct)) * 100)
+        if abs(diff) >= 2:
+            sign = "+" if diff > 0 else ""
+            delta_str = f" ({sign}{diff}%)"
+
+    if home_pct >= away_pct:
+        leader_part = f"{game.home.abbr} {h_int}%{delta_str} | {game.away.abbr} {a_int}%"
+    else:
+        leader_part = f"{game.away.abbr} {a_int}%{delta_str} | {game.home.abbr} {h_int}%"
+
+    html_line = f"📊 <b>Win Prob (ESPN):</b> {html.escape(leader_part)}"
+    banner_note = f"Win Prob (ESPN): {game.away.abbr} {a_int}%  |  {game.home.abbr} {h_int}%"
+    return home_pct, html_line, banner_note
+
+
+def extract_peak_win_prob_swing(game: GameSnapshot, summary: dict[str, Any]) -> str:
+    wp = summary.get("winprobability") or []
+    if len(wp) < 10:
+        return ""
+    home_vals = [float(x.get("homeWinPercentage", 0.5)) for x in wp if x.get("homeWinPercentage") is not None]
+    if not home_vals:
+        return ""
+    cur_home = home_vals[-1]
+    max_home = max(home_vals)
+    max_away = max(1.0 - v for v in home_vals)
+    if cur_home < 0.55 and max_home >= 0.75:
+        return f"Win prob swing: {game.home.name} peaked at {round(max_home * 100)}% win probability earlier."
+    if (1.0 - cur_home) < 0.55 and max_away >= 0.75:
+        return f"Win prob swing: {game.away.name} peaked at {round(max_away * 100)}% win probability earlier."
+    return ""
+
+
+def foul_trouble_threshold(period: int) -> int:
+    """Kelvin's foul-trouble rules: Q1>=2, Q2>=3, Q3>=4, Q4/OT>=5."""
+    if period <= 1:
+        return 2
+    if period == 2:
+        return 3
+    if period == 3:
+        return 4
+    return 5
+
+
+def extract_foul_trouble(game: GameSnapshot, summary: dict[str, Any]) -> list[str]:
+    thresh = foul_trouble_threshold(game.period)
+    alerts: list[str] = []
+    for group in summary.get("boxscore", {}).get("players", []):
+        abbr = group.get("team", {}).get("abbreviation", "???")
+        stat_blocks = group.get("statistics", [])
+        if not stat_blocks:
+            continue
+        labels = [lbl.upper() for lbl in stat_blocks[0].get("labels", [])]
+        if "PF" not in labels:
+            continue
+        pf_idx = labels.index("PF")
+        for entry in stat_blocks[0].get("athletes", []):
+            if entry.get("didNotPlay"):
+                continue
+            stats = entry.get("stats", [])
+            if pf_idx >= len(stats):
+                continue
+            try:
+                pf = int(stats[pf_idx])
+            except ValueError:
+                continue
+            if pf >= thresh:
+                name = entry.get("athlete", {}).get("displayName") or entry.get("athlete", {}).get("shortName", "Player")
+                note = "FOULED OUT (6 PF)" if pf >= 6 else (f"{pf} PF — 1 away from fouling out" if pf == 5 else f"{pf} PF in Q{game.period}")
+                alerts.append(f"[{abbr}] {name}: {note}")
+    return alerts
+
+
+def compute_team_fouls_status(game: GameSnapshot, summary: dict[str, Any]) -> str:
+    """Count current-quarter team fouls (excluding offensive/technical/def-3s) & flag NBA Bonus."""
+    plays = summary.get("plays", [])
+    if not plays or game.period <= 0:
+        return ""
+    id_to_abbr = {game.away.team_id: game.away.abbr, game.home.team_id: game.home.abbr}
+    q_fouls = {game.away.abbr: 0, game.home.abbr: 0}
+    last2_fouls = {game.away.abbr: 0, game.home.abbr: 0}
+
+    for p in plays:
+        if int(p.get("period", {}).get("number", 0) or 0) != game.period:
+            continue
+        txt = str(p.get("text", "")).lower()
+        if "foul" not in txt:
+            continue
+        if any(skip in txt for skip in ("offensive", "technical", "defensive 3", "double technical", "delay of game")):
+            continue
+        tid = str(p.get("team", {}).get("id", ""))
+        abbr = id_to_abbr.get(tid)
+        if not abbr:
+            continue
+        q_fouls[abbr] += 1
+        clk_val = p.get("clock", {}).get("value")
+        if clk_val is not None:
+            try:
+                if float(clk_val) <= 120.0:
+                    last2_fouls[abbr] += 1
+            except (TypeError, ValueError):
+                pass
+
+    def fmt_side(committing: str, beneficiary: str) -> str:
+        cnt = q_fouls[committing]
+        l2 = last2_fouls[committing]
+        if cnt >= 5 or l2 >= 2:
+            return f"{committing} {cnt} ({beneficiary} IN THE BONUS)"
+        if cnt == 4 or (game.clock_seconds <= 120.0 and l2 == 1):
+            return f"{committing} {cnt} (1 away from {beneficiary} bonus)"
+        return f"{committing} {cnt}"
+
+    p_lbl = f"Q{game.period}" if game.period <= 4 else f"OT{game.period - 4}"
+    return f"Team Fouls ({p_lbl}): {fmt_side(game.away.abbr, game.home.abbr)} | {fmt_side(game.home.abbr, game.away.abbr)}"
+
+
 def extract_top_performers(summary: dict[str, Any], top_n: int = 3) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     for group in summary.get("boxscore", {}).get("players", []):
@@ -622,7 +769,13 @@ def extract_top_performers(summary: dict[str, Any], top_n: int = 3) -> dict[str,
             name = entry.get("athlete", {}).get("displayName") or entry.get("athlete", {}).get("shortName", "Player")
             fg = get_stat("FG")
             tp = get_stat("3PT")
-            extra = f", {tp} 3PT" if tp and tp != "0-0" else ""
+            pf = get_stat("PF")
+            extra_parts = []
+            if tp and tp != "0-0":
+                extra_parts.append(f"{tp} 3PT")
+            if pf and pf != "0":
+                extra_parts.append(f"{pf} PF")
+            extra = (", " + ", ".join(extra_parts)) if extra_parts else ""
             parsed.append((pts, reb + ast, f"{name}: {pts} PTS, {reb} REB, {ast} AST ({fg} FG{extra})"))
         parsed.sort(key=lambda x: (x[0], x[1]), reverse=True)
         result[abbr] = [p[2] for p in parsed[:top_n]]
@@ -652,22 +805,36 @@ def detect_comeback_and_run(game: GameSnapshot, summary: dict[str, Any]) -> list
             notes.append(f"Hot stretch: {game.away.name} on a {run_a}-{run_h} run.")
         elif run_h - run_a >= 8:
             notes.append(f"Hot stretch: {game.home.name} on a {run_h}-{run_a} run.")
+    wp_swing = extract_peak_win_prob_swing(game, summary)
+    if wp_swing:
+        notes.append(wp_swing)
     return notes
 
 
-def extract_recent_plays(summary: dict[str, Any], limit: int = 8) -> list[str]:
+def format_play_with_team(game: GameSnapshot, play: dict[str, Any]) -> str:
+    """Format an ESPN play with explicit [TEAM] tag and clock/score so Gemini never misattributes a play."""
+    text = str(play.get("text", "")).strip()
+    if not text:
+        return ""
+    id_to_abbr = {game.away.team_id: game.away.abbr, game.home.team_id: game.home.abbr}
+    tid = str(play.get("team", {}).get("id", ""))
+    team_tag = f"[{id_to_abbr[tid]}] " if tid in id_to_abbr else ""
+    clock = play.get("clock", {}).get("displayValue", "")
+    qtr = play.get("period", {}).get("number", "")
+    score_tag = f" ({game.away.abbr} {play.get('awayScore')}-{play.get('homeScore')} {game.home.abbr})" if play.get("scoringPlay") else ""
+    return f"[Q{qtr} {clock}] {team_tag}{text}{score_tag}"
+
+
+def extract_recent_plays(game: GameSnapshot, summary: dict[str, Any], limit: int = 10) -> list[str]:
     plays = summary.get("plays", [])
     recent: list[str] = []
     for p in plays[-20:]:
-        text = str(p.get("text", "")).strip()
-        if not text:
+        txt = str(p.get("text", "")).strip()
+        if not txt or txt.lower().startswith("end of the"):
             continue
-        is_scoring = bool(p.get("scoringPlay"))
-        if is_scoring or any(k in text.lower() for k in ("steal", "block", "turnover", "timeout", "foul", "challenge")):
-            clock = p.get("clock", {}).get("displayValue", "")
-            qtr = p.get("period", {}).get("number", "")
-            score_tag = f" ({p.get('awayScore')}-{p.get('homeScore')})" if is_scoring else ""
-            recent.append(f"[Q{qtr} {clock}] {text}{score_tag}")
+        formatted = format_play_with_team(game, p)
+        if formatted:
+            recent.append(formatted)
     return recent[-limit:]
 
 
@@ -677,6 +844,18 @@ def format_linescore_compact(game: GameSnapshot) -> str:
     a_str = "-".join(str(s) for s in game.away.linescores)
     h_str = "-".join(str(s) for s in game.home.linescores)
     return f"{game.away.abbr} ({a_str} = {game.away.score}) | {game.home.abbr} ({h_str} = {game.home.score})"
+
+
+def format_linescore_code_block(game: GameSnapshot) -> str:
+    """Clean aligned monospaced quarter-by-quarter block for Telegram HTML."""
+    if not game.away.linescores or not game.home.linescores:
+        return ""
+    n_q = max(len(game.away.linescores), len(game.home.linescores))
+    quarters = [f"Q{i+1}" if i < 4 else f"OT{i-3}" for i in range(n_q)]
+    hdr = "     " + " ".join(f"{q:>3}" for q in quarters) + " | TOT"
+    a_row = f"{game.away.abbr:<4} " + " ".join(f"{s:>3}" for s in game.away.linescores) + f" | {game.away.score:>3}"
+    h_row = f"{game.home.abbr:<4} " + " ".join(f"{s:>3}" for s in game.home.linescores) + f" | {game.home.score:>3}"
+    return f"<code>{html.escape(hdr)}\n{html.escape(a_row)}\n{html.escape(h_row)}</code>"
 
 
 def is_pbp_behind_scoreboard(game: GameSnapshot, summary: dict[str, Any]) -> bool:
@@ -690,82 +869,136 @@ def is_pbp_behind_scoreboard(game: GameSnapshot, summary: dict[str, Any]) -> boo
     return pbp_a < game.away.score or pbp_h < game.home.score
 
 
-def build_crunch_intro(game: GameSnapshot, summary: dict[str, Any], summarizer: GeminiSummarizer | None = None) -> tuple[str, str, int, bytes | None]:
+def build_crunch_intro(
+    game: GameSnapshot,
+    summary: dict[str, Any],
+    summarizer: GeminiSummarizer | None = None,
+) -> tuple[str, str, int, bytes | None, float | None]:
     period_lbl = f"Q{game.period}" if game.period <= 4 else f"OT{game.period - 4}"
     title = f"🏀 Crunch Time ({period_lbl} {game.display_clock}) — {game.score_line()}"
-    ls_compact = format_linescore_compact(game)
+    ls_code = format_linescore_code_block(game)
+    home_wp, wp_html, wp_banner = extract_win_probability(game, summary)
     story_notes = detect_comeback_and_run(game, summary)
     performers = extract_top_performers(summary, top_n=3)
-    recent_plays = extract_recent_plays(summary, limit=8)
+    foul_trouble = extract_foul_trouble(game, summary)
+    team_fouls = compute_team_fouls_status(game, summary)
+    recent_plays = extract_recent_plays(game, summary, limit=10)
 
-    fallback_lines = []
-    if ls_compact:
-        fallback_lines.append(f"<b>Quarters:</b> {html.escape(ls_compact)}")
-    if story_notes:
-        fallback_lines.extend(f"• {html.escape(n)}" for n in story_notes)
-    if performers:
-        fallback_lines.append("\n<b>Top performers:</b>")
-        for abbr in (game.away.abbr, game.home.abbr):
-            fallback_lines.extend(f"• [{abbr}] {html.escape(p)}" for p in performers.get(abbr, [])[:2])
-    fallback_body = "\n".join(fallback_lines)
+    # Fallback body (clean team-split)
+    fb_parts = [p for p in (ls_code, wp_html) if p]
+    for tm in (game.away, game.home):
+        tp = performers.get(tm.abbr, [])[:2]
+        if tp:
+            fb_parts.append(f"<b>{team_badge(tm.abbr)} {html.escape(tm.name)}</b>\n" + "\n".join(f"• {html.escape(x)}" for x in tp))
+    if foul_trouble or team_fouls:
+        extra_f = ([team_fouls] if team_fouls else []) + foul_trouble
+        fb_parts.append("<b>Foul watch:</b> " + html.escape(" | ".join(extra_f)))
+    fallback_body = "\n\n".join(fb_parts)
 
     away_lbl = f"{game.away.name} ({game.away.record})" if game.away.record else game.away.name
     home_lbl = f"{game.home.name} ({game.home.record})" if game.home.record else game.home.name
-    raw_context_parts = [
+    raw_context = "\n\n".join(filter(None, [
         f"Matchup: {away_lbl} @ {home_lbl}",
-        f"Current Score & Clock: {game.away.abbr} {game.away.score}, {game.home.abbr} {game.home.score} ({period_lbl} {game.display_clock})",
-        f"Quarter-by-quarter: {ls_compact}" if ls_compact else "",
-        "Comeback / Run Notes:\n" + "\n".join(f"- {n}" for n in story_notes) if story_notes else "Comeback / Run Notes: None flagged",
-        "Top Performers:\n"
-        + "\n".join(
+        f"Current State: {game.lead_summary()} ({period_lbl} {game.display_clock})",
+        f"Quarter-by-quarter: {format_linescore_compact(game)}",
+        wp_banner,
+        team_fouls,
+        ("Personal Foul Trouble:\n" + "\n".join(f"- {f}" for f in foul_trouble)) if foul_trouble else "",
+        ("Comeback / Run Notes:\n" + "\n".join(f"- {n}" for n in story_notes)) if story_notes else "",
+        "Top Performers:\n" + "\n".join(
             f"- {abbr}: " + " | ".join(performers.get(abbr, []))
             for abbr in (game.away.abbr, game.home.abbr)
         ),
-        "Most Recent Key Plays:\n" + "\n".join(f"- {rp}" for rp in recent_plays) if recent_plays else "",
-    ]
-    raw_context = "\n\n".join(p for p in raw_context_parts if p)
+        ("Most Recent Plays:\n" + "\n".join(f"- {rp}" for rp in recent_plays)) if recent_plays else "",
+    ]))
 
     instruction = (
-        "Write a clean, easy-to-scan crunch-time update for this close game:\n"
-        "1. Lead directly with a compact <b>Quarter flow:</b> line (no greeting or hype intro).\n"
-        "2. Add 3–4 crisp • bullets covering the game's momentum/comeback context, who's driving each side (notable efficiency, shooting struggles, or triple-double watches), and what happened on the most recent possessions."
+        "Write a strong, clean Crunch-Time Intro split clearly by team (do NOT include a quarter-by-quarter table or win-prob line—those are prepended automatically):\n"
+        f"1. <b>{team_badge(game.away.abbr)} {game.away.name}:</b> 1–2 crisp • bullets. Lead with the biggest game-long star/performer FIRST, then mention any key supporting/clutch plays or foul trouble.\n"
+        f"2. <b>{team_badge(game.home.abbr)} {game.home.name}:</b> 1–2 crisp • bullets. Same order—biggest game-long performer FIRST, then supporting/clutch plays or foul trouble.\n"
+        "3. <b>The Setup:</b> 1 short closing sentence on how we got here (comeback, late-Q3 swing, or bonus/foul-trouble factor heading into crunch time)."
     )
-    body = summarizer.summarize(instruction, raw_context, fallback_body) if (summarizer and summarizer.enabled) else fallback_body
-    banner = render_matchup_banner(game, f"CRUNCH TIME · {period_lbl} {game.display_clock}")
+    ai_body = summarizer.summarize(instruction, raw_context, "", max_tokens=700) if (summarizer and summarizer.enabled) else ""
+    if ai_body:
+        header_meta = "\n".join(p for p in (ls_code, wp_html) if p)
+        body = f"{header_meta}\n\n{ai_body}" if header_meta else ai_body
+    else:
+        body = fallback_body
+
+    banner = render_matchup_banner(game, f"CRUNCH TIME · {period_lbl} {game.display_clock}", win_prob_note=wp_banner)
     plays = summary.get("plays", [])
-    return title, body, int(plays[-1].get("sequenceNumber", len(plays))) if plays else 0, banner
+    return title, body, int(plays[-1].get("sequenceNumber", len(plays))) if plays else 0, banner, home_wp
+
+
+def build_final_recap(
+    game: GameSnapshot,
+    summary: dict[str, Any],
+    last_seq: int,
+    summarizer: GeminiSummarizer | None = None,
+) -> tuple[str, str, int, bytes | None]:
+    """Always build a proper Final wrap-up with FINAL team-logo banner (never 'Quiet minute')."""
+    title = f"🏁 Final — {game.score_line()}"
+    ls_code = format_linescore_code_block(game)
+    performers = extract_top_performers(summary, top_n=2)
+    story_notes = detect_comeback_and_run(game, summary)
+    recent_plays = extract_recent_plays(game, summary, limit=8)
+
+    fb_parts = [ls_code] if ls_code else []
+    for tm in (game.away, game.home):
+        tp = performers.get(tm.abbr, [])
+        if tp:
+            fb_parts.append(f"<b>{team_badge(tm.abbr)} {html.escape(tm.name)}</b>\n" + "\n".join(f"• {html.escape(x)}" for x in tp))
+    fallback_body = "\n\n".join(fb_parts)
+
+    raw_context = "\n\n".join(filter(None, [
+        f"Final: {game.away.name} {game.away.score}, {game.home.name} {game.home.score} ({game.lead_summary()})",
+        f"Quarter-by-quarter: {format_linescore_compact(game)}",
+        ("Comeback / Win-Prob Swing:\n" + "\n".join(f"- {n}" for n in story_notes)) if story_notes else "",
+        "Top Performers:\n" + "\n".join(
+            f"- {abbr}: " + " | ".join(performers.get(abbr, []))
+            for abbr in (game.away.abbr, game.home.abbr)
+        ),
+        ("Closing Plays:\n" + "\n".join(f"- {rp}" for rp in recent_plays)) if recent_plays else "",
+    ]))
+    instruction = (
+        "Write a crisp NBA beat-writer Final Buzzer wrap-up (do NOT include the linescore—it is prepended automatically):\n"
+        "• 2–3 tight bullets covering who closed it out in the final minute, the game's top star stat line on each side, and any comeback/win-probability swing."
+    )
+    ai_body = summarizer.summarize(instruction, raw_context, "", max_tokens=550) if (summarizer and summarizer.enabled) else ""
+    body = f"{ls_code}\n\n{ai_body}" if (ai_body and ls_code) else (ai_body or fallback_body)
+
+    banner = render_matchup_banner(game, "FINAL")
+    plays = summary.get("plays", [])
+    newest_seq = max(last_seq, int(plays[-1].get("sequenceNumber", len(plays))) if plays else last_seq)
+    return title, body, newest_seq, banner
 
 
 def build_minute_update(
     game: GameSnapshot,
     summary: dict[str, Any],
     last_seq: int,
+    prev_home_win_pct: float | None = None,
     summarizer: GeminiSummarizer | None = None,
     summary_fetcher: Callable[[str], dict[str, Any]] | None = None,
     sync_retry_delay: float = 8.0,
-) -> tuple[str, str, int] | None:
-    """Build a 1-minute crunch update. Returns None if play-by-play is lagging behind a score jump."""
-    def collect(summ: dict[str, Any]) -> tuple[list[str], int]:
+) -> tuple[str, str, int, float | None] | None:
+    """Build a 1-minute crunch update using ALL new plays. Returns None if PBP lags a score jump."""
+    def collect_all_plays(summ: dict[str, Any]) -> tuple[list[str], int]:
         plays = summ.get("plays", [])
-        new_plays, newest = [], last_seq
+        all_new, newest = [], last_seq
         for idx, p in enumerate(plays, start=1):
             seq = int(p.get("sequenceNumber", idx) or idx)
             if seq > last_seq:
-                new_plays.append(p)
                 newest = max(newest, seq)
-        hl = []
-        for p in new_plays:
-            text = str(p.get("text", "")).strip()
-            if not text:
-                continue
-            is_scoring = bool(p.get("scoringPlay"))
-            if is_scoring or any(k in text.lower() for k in ("steal", "block", "turnover", "timeout", "foul", "challenge")):
-                clock = p.get("clock", {}).get("displayValue", "")
-                score_tag = f" ({p.get('awayScore')}-{p.get('homeScore')})" if is_scoring else ""
-                hl.append(f"[{clock}] {text}{score_tag}")
-        return hl, newest
+                txt = str(p.get("text", "")).strip()
+                if not txt or txt.lower().startswith("end of the"):
+                    continue
+                formatted = format_play_with_team(game, p)
+                if formatted:
+                    all_new.append(formatted)
+        return all_new, newest
 
-    highlights, newest_seq = collect(summary)
+    all_new_plays, newest_seq = collect_all_plays(summary)
 
     # ESPN sync guard: if scoreboard shows new points not yet in play-by-play, wait briefly and re-fetch once
     if is_pbp_behind_scoreboard(game, summary):
@@ -774,75 +1007,95 @@ def build_minute_update(
             time.sleep(sync_retry_delay)
             try:
                 summary = summary_fetcher(game.game_id)
-                highlights, newest_seq = collect(summary)
+                all_new_plays, newest_seq = collect_all_plays(summary)
             except Exception as exc:
                 log.warning("Sync re-fetch failed for %s: %s", game.short_name, exc)
-        if not highlights and is_pbp_behind_scoreboard(game, summary) and not game.is_final:
+        if not all_new_plays and is_pbp_behind_scoreboard(game, summary):
             log.info("Deferring update for %s until play-by-play catches up with scoreboard.", game.short_name)
             return None
 
-    period_lbl = "FINAL" if game.is_final else (f"Q{game.period} {game.display_clock}" if game.period <= 4 else f"OT{game.period - 4} {game.display_clock}")
-    prefix = "🏁 Final" if game.is_final else f"⏱ {period_lbl}"
-    title = f"{prefix} — {game.score_line()}"
+    period_lbl = f"Q{game.period} {game.display_clock}" if game.period <= 4 else f"OT{game.period - 4} {game.display_clock}"
+    title = f"⏱ {period_lbl} — {game.score_line()}"
+    home_wp, wp_html, wp_banner = extract_win_probability(game, summary, prev_home_win_pct)
 
-    if not highlights:
-        return title, "<i>Quiet minute — timeout, stoppage, or empty trips on both ends.</i>", newest_seq
-    fallback_body = "<b>Last minute:</b>\n" + "\n".join(f"• {html.escape(h)}" for h in highlights[-8:])
-    if game.is_final:
-        performers = extract_top_performers(summary, top_n=2)
-        perf_ctx = "\n".join(
-            f"- {abbr}: " + " | ".join(performers.get(abbr, []))
-            for abbr in (game.away.abbr, game.home.abbr)
-        )
-        instruction = (
-            "Write a brisk, clean final-buzzer wrap-up (2 short sentences + 2 • bullets): "
-            "how the closing minute sealed it, who closed the game out, and the top stat line."
-        )
-        raw_context = f"Final: {game.away.name} {game.away.score}, {game.home.name} {game.home.score}\nClosing plays:\n" + "\n".join(highlights[-8:]) + f"\n\nTop performers:\n{perf_ctx}"
-    else:
-        instruction = (
-            "Summarize the last minute of this close game in 2–3 crisp • bullets covering who scored, "
-            "any key stops, turnovers, fouls, or timeouts, and the current momentum."
-        )
-        raw_context = f"Score: {game.away.name} {game.away.score}, {game.home.name} {game.home.score} ({period_lbl})\nPlays in last minute:\n" + "\n".join(highlights[-8:])
-    body = summarizer.summarize(instruction, raw_context, fallback_body, max_tokens=450) if (summarizer and summarizer.enabled) else fallback_body
-    return title, body, newest_seq
+    if not all_new_plays:
+        quiet = "<i>Quiet minute — timeout, stoppage, or empty trips on both ends.</i>"
+        body = f"{wp_html}\n{quiet}" if wp_html else quiet
+        return title, body, newest_seq, home_wp
 
+    foul_trouble = extract_foul_trouble(game, summary)
+    team_fouls = compute_team_fouls_status(game, summary)
 
-def build_lakers_quarter_update(game: GameSnapshot, summary: dict[str, Any], period_done: int, summarizer: GeminiSummarizer | None = None) -> tuple[str, str, bytes | None]:
-    label = "Final" if game.is_final else ("Halftime" if period_done == 2 else (f"End of Q{period_done}" if period_done <= 4 else f"End of OT{period_done - 4}"))
-    title = f"💜💛 Lakers {label} — {game.score_line()}"
-    ls_compact = format_linescore_compact(game)
-    performers = extract_top_performers(summary, top_n=3)
-    story_notes = detect_comeback_and_run(game, summary)
-
-    fallback_lines = []
-    if ls_compact:
-        fallback_lines.append(f"<b>Quarters:</b> {html.escape(ls_compact)}")
-    if performers:
-        fallback_lines.append("\n<b>Leaders:</b>")
-        for abbr in (game.away.abbr, game.home.abbr):
-            fallback_lines.extend(f"• [{abbr}] {html.escape(p)}" for p in performers.get(abbr, [])[:2])
+    fallback_lines = [wp_html] if wp_html else []
+    fallback_lines.append("<b>Last minute:</b>")
+    fallback_lines.extend(f"• {html.escape(h)}" for h in all_new_plays[-10:])
     fallback_body = "\n".join(fallback_lines)
 
     raw_context = "\n\n".join(filter(None, [
+        f"Current State: {game.lead_summary()} ({period_lbl})",
+        wp_banner,
+        team_fouls,
+        ("Personal Foul Trouble:\n" + "\n".join(f"- {f}" for f in foul_trouble)) if foul_trouble else "",
+        "Complete Play Sequence in Last Minute (chronological):\n" + "\n".join(all_new_plays[-15:]),
+    ]))
+    instruction = (
+        "Tell the story of what happened in the last minute in 1–3 crisp • bullets (do NOT include the win-prob line or restate the header score/clock):\n"
+        "- Cover the actual flow (made/missed shots, missed free throws, And-1s, rebounds, fouls, turnovers, timeouts).\n"
+        "- Merge linked plays (And-1 + foul, foul + FTs, steal + bucket) into a single bullet.\n"
+        "- Call out foul trouble (5+ PF in Q4) or a team entering/in the bonus if triggered during this minute."
+    )
+    ai_body = summarizer.summarize(instruction, raw_context, "", max_tokens=450) if (summarizer and summarizer.enabled) else ""
+    if ai_body:
+        body = f"{wp_html}\n{ai_body}" if wp_html else ai_body
+    else:
+        body = fallback_body
+    return title, body, newest_seq, home_wp
+
+
+def build_lakers_quarter_update(
+    game: GameSnapshot,
+    summary: dict[str, Any],
+    period_done: int,
+    summarizer: GeminiSummarizer | None = None,
+) -> tuple[str, str, bytes | None]:
+    label = "Final" if game.is_final else ("Halftime" if period_done == 2 else (f"End of Q{period_done}" if period_done <= 4 else f"End of OT{period_done - 4}"))
+    title = f"💜💛 Lakers {label} — {game.score_line()}"
+    ls_code = format_linescore_code_block(game)
+    _, wp_html, wp_banner = extract_win_probability(game, summary)
+    performers = extract_top_performers(summary, top_n=3)
+    story_notes = detect_comeback_and_run(game, summary)
+    foul_trouble = extract_foul_trouble(game, summary)
+
+    fb_parts = [p for p in (ls_code, wp_html) if p]
+    for tm in (game.away, game.home):
+        tp = performers.get(tm.abbr, [])[:2]
+        if tp:
+            fb_parts.append(f"<b>{team_badge(tm.abbr)} {html.escape(tm.name)}</b>\n" + "\n".join(f"• {html.escape(x)}" for x in tp))
+    fallback_body = "\n\n".join(fb_parts)
+
+    raw_context = "\n\n".join(filter(None, [
         f"Game: {game.away.name} @ {game.home.name} ({label})",
-        f"Score: {game.score_line(with_emojis=False)}",
-        f"Quarter-by-quarter: {ls_compact}" if ls_compact else "",
-        "Runs / Comebacks:\n" + "\n".join(f"- {n}" for n in story_notes) if story_notes else "",
+        f"Current State: {game.lead_summary()}",
+        f"Quarter-by-quarter: {format_linescore_compact(game)}",
+        wp_banner,
+        ("Foul Trouble:\n" + "\n".join(f"- {f}" for f in foul_trouble)) if foul_trouble else "",
+        ("Runs / Comebacks:\n" + "\n".join(f"- {n}" for n in story_notes)) if story_notes else "",
         "Top Performers:\n" + "\n".join(
             f"- {abbr}: " + " | ".join(performers.get(abbr, []))
             for abbr in (game.away.abbr, game.home.abbr)
         ),
     ]))
     instruction = (
-        f"Write a sharp, clean {label} check-in for a Lakers fan:\n"
-        "1. 1–2 sentences on how the Lakers look right now and the quarter's momentum.\n"
-        "2. Compact <b>Quarters:</b> line.\n"
-        "3. 2–3 crisp • bullets on who's carrying LA, who's hurting them on the other side, and what to watch next."
+        f"Write a sharp NBA beat-writer {label} check-in for a Lakers fan (do NOT include the linescore or win-prob line—they are prepended automatically):\n"
+        "• 2–3 crisp bullets covering how the Lakers look right now, who's leading LA and the opponent (plus any foul trouble), and what to watch next."
     )
-    body = summarizer.summarize(instruction, raw_context, fallback_body) if (summarizer and summarizer.enabled) else fallback_body
-    banner = render_matchup_banner(game, f"LAKERS · {label}")
+    ai_body = summarizer.summarize(instruction, raw_context, "", max_tokens=600) if (summarizer and summarizer.enabled) else ""
+    if ai_body:
+        header_meta = "\n".join(p for p in (ls_code, wp_html) if p)
+        body = f"{header_meta}\n\n{ai_body}" if header_meta else ai_body
+    else:
+        body = fallback_body
+    banner = render_matchup_banner(game, f"LAKERS · {label}", win_prob_note=wp_banner)
     return title, body, banner
 
 
@@ -945,23 +1198,22 @@ def process_games(
 
         if g.is_live and g.period >= 4:
             if not tr.crunch_alerted and g.margin <= close_margin:
-                title, body, last_seq, banner = build_crunch_intro(g, get_summary(), summarizer)
+                title, body, last_seq, banner, home_wp = build_crunch_intro(g, get_summary(), summarizer)
                 notifier.send(title, body, photo_bytes=banner)
-                tr.crunch_alerted, tr.last_play_seq = True, last_seq
+                tr.crunch_alerted, tr.last_play_seq, tr.last_home_win_pct = True, last_seq, home_wp
             elif tr.crunch_alerted:
-                res = build_minute_update(g, get_summary(), tr.last_play_seq, summarizer, summary_fetcher, sync_retry_delay)
+                res = build_minute_update(g, get_summary(), tr.last_play_seq, tr.last_home_win_pct, summarizer, summary_fetcher, sync_retry_delay)
                 if res is not None:
-                    title, body, newest_seq = res
+                    title, body, newest_seq, home_wp = res
                     minute_batch.append((title, body))
                     tr.last_play_seq = newest_seq
+                    if home_wp is not None:
+                        tr.last_home_win_pct = home_wp
         elif g.is_final and tr.crunch_alerted and not tr.crunch_final_sent:
-            res = build_minute_update(g, get_summary(), tr.last_play_seq, summarizer, summary_fetcher, sync_retry_delay)
-            if res is not None:
-                title, body, newest_seq = res
-                minute_batch.append((title, body))
-                tr.last_play_seq, tr.crunch_final_sent = newest_seq, True
+            title, body, newest_seq, banner = build_final_recap(g, get_summary(), tr.last_play_seq, summarizer)
+            notifier.send(title, body, photo_bytes=banner)
+            tr.last_play_seq, tr.crunch_final_sent = newest_seq, True
 
-    # Combined multi-game digest when 2+ crunch-time games tick on the same minute
     if len(minute_batch) == 1:
         notifier.send(minute_batch[0][0], minute_batch[0][1])
     elif len(minute_batch) > 1:
