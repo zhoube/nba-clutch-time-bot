@@ -37,7 +37,7 @@ jobs:
 
       - name: Run NBA Crunch Watcher
         env:
-          TELEGRAM_BOT_TOKEN: 9072370495:AAGEayL2ree_FQmetUn0Uk4RxiOu4dQT_qU/
+          TELEGRAM_BOT_TOKEN: 9072370495:AAGEayL2ree_FQmetUn0Uk4RxiOu4dQT_qU
           TELEGRAM_CHAT_ID: 681229105
           GEMINI_API_KEY: AQ.Ab8RN6IeBd6N707DvrqB_Q5rZkvVoCVHDJUL6oLkOsnKmr-LxA
           GEMINI_MODEL: "gemini-4-hydrogen"
