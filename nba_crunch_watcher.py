@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-NBA Crunch-Time & Lakers Watcher (Adaptive Polling + Conversational Gemini Summaries)
-=====================================================================================
-Monitors live NBA games using ESPN's public JSON scoreboard & game summary APIs
-(no external pip packages required; pure Python 3.10+ stdlib).
+NBA Crunch-Time & Lakers Watcher (Adaptive Polling + Gemini Editorial Summaries + Team-Logo Banners)
+====================================================================================================
+Monitors live NBA games using ESPN's public JSON scoreboard & game summary APIs.
+Uses Pillow (optional) to render real ESPN team-logo matchup banners on initial crunch-time alerts
+and Lakers end-of-quarter recaps; gracefully falls back to text-only if Pillow is unavailable.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import html
+import io
 import json
 import logging
 import os
@@ -20,9 +22,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None  # type: ignore[assignment]
 
 SGT = ZoneInfo("Asia/Singapore")
 UTC = ZoneInfo("UTC")
@@ -31,7 +39,7 @@ ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/
 ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen"
-USER_AGENT = "NBACrunchWatcher/2.0 (+https://github.com/)"
+USER_AGENT = "NBACrunchWatcher/2.2 (+https://github.com/)"
 
 # Built-in Telegram topic target: "Sarah and Kelvin" supergroup -> "NBA" topic
 BUILTIN_TELEGRAM_TARGETS = ["-1002615344601:270"]
@@ -40,12 +48,31 @@ LAKERS_ABBR = "LAL"
 CLOSE_MARGIN_DEFAULT = 10
 CRUNCH_POLL_SECONDS = 60
 
+# Official NBA Rule 5 intermission lengths: 15 min halftime; 2:30 local (3:30 national TV) quarter/OT breaks
+HALFTIME_SLEEP_SECONDS = 15 * 60
+QUARTER_BREAK_SLEEP_SECONDS = 150  # 2.5 minutes
+
+TEAM_EMOJI: dict[str, str] = {
+    "ATL": "🦅", "BOS": "☘️", "BKN": "🕸️", "CHA": "🐝", "CHI": "🐂",
+    "CLE": "⚔️", "DAL": "🐴", "DEN": "⛏️", "DET": "⚙️", "GS": "🌉",
+    "GSW": "🌉", "HOU": "🚀", "IND": "🏎️", "LAC": "⛵", "LAL": "💜💛",
+    "MEM": "🐻", "MIA": "🔥", "MIL": "🦌", "MIN": "🐺", "NO": "⚜️",
+    "NOP": "⚜️", "NY": "🗽", "NYK": "🗽", "OKC": "⚡", "ORL": "🪄",
+    "PHI": "🔔", "PHX": "☀️", "POR": "❤️", "SA": "🖤", "SAS": "🖤",
+    "SAC": "👑", "TOR": "🦖", "UTA": "🎵", "UTAH": "🎵", "WAS": "🧙",
+    "WSH": "🧙",
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("nba_watcher")
+
+
+def team_badge(abbr: str) -> str:
+    return TEAM_EMOJI.get(abbr.upper(), "🏀")
 
 
 @dataclass
@@ -56,6 +83,8 @@ class TeamSnapshot:
     score: int
     linescores: list[int] = field(default_factory=list)
     record: str = ""
+    logo_url: str = ""
+    color_hex: str = ""
 
 
 @dataclass
@@ -105,7 +134,9 @@ class GameSnapshot:
             or "halftime" in detail_l
         )
 
-    def score_line(self) -> str:
+    def score_line(self, with_emojis: bool = True) -> str:
+        if with_emojis:
+            return f"{team_badge(self.away.abbr)} {self.away.abbr} {self.away.score} – {self.home.score} {self.home.abbr} {team_badge(self.home.abbr)}"
         return f"{self.away.abbr} {self.away.score} – {self.home.score} {self.home.abbr}"
 
 
@@ -116,6 +147,19 @@ class GameTracker:
     last_play_seq: int = 0
     last_lakers_period_sent: int = 0
     lakers_final_sent: bool = False
+
+
+def http_get_bytes(url: str, timeout: int = 15, retries: int = 2) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_err = exc
+            time.sleep(min(5, 2 ** attempt))
+    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
 
 
 def http_get_json(url: str, timeout: int = 20, retries: int = 3) -> dict[str, Any]:
@@ -143,9 +187,7 @@ def strip_html_tags(text: str) -> str:
 
 def sanitize_telegram_html(text: str) -> str:
     """Keep only Telegram-safe inline HTML tags (<b>, <i>, <code>) and escape stray <, >, &."""
-    # Convert accidental Markdown bold (**text**) into Telegram HTML <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    # Temporarily shield allowed tags
     placeholders: dict[str, str] = {}
     for idx, tag in enumerate(("<b>", "</b>", "<i>", "</i>", "<code>", "</code>")):
         token = f"__TG_TAG_{idx}__"
@@ -155,6 +197,128 @@ def sanitize_telegram_html(text: str) -> str:
     for token, tag in placeholders.items():
         text = text.replace(token, tag)
     return text.strip()
+
+
+def _parse_hex_color(hex_str: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    cleaned = hex_str.strip().lstrip("#")
+    if len(cleaned) == 6:
+        try:
+            return int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16)
+        except ValueError:
+            pass
+    return default
+
+
+def _load_font(size: int, bold: bool = True) -> Any:
+    if ImageFont is None:
+        return None
+    candidates = (
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+        if bold
+        else [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                pass
+    return ImageFont.load_default()
+
+
+def render_matchup_banner(game: GameSnapshot, status_badge: str) -> bytes | None:
+    """Render a 900x320 broadcast-style matchup banner with real ESPN team PNG logos."""
+    if Image is None or ImageDraw is None:
+        return None
+    try:
+        w, h = 900, 320
+        bg = (15, 23, 42)  # dark slate
+        img = Image.new("RGBA", (w, h), bg + (255,))
+        draw = ImageDraw.Draw(img)
+
+        away_col = _parse_hex_color(game.away.color_hex, (59, 130, 246))
+        home_col = _parse_hex_color(game.home.color_hex, (239, 68, 68))
+
+        # Top team-color accent bars
+        draw.rectangle([0, 0, w // 2, 10], fill=away_col + (255,))
+        draw.rectangle([w // 2, 0, w, 10], fill=home_col + (255,))
+        # Subtle card divider
+        draw.rounded_rectangle([24, 26, w - 24, h - 24], radius=22, fill=(24, 34, 58, 255), outline=(51, 65, 85, 255), width=2)
+
+        def fetch_logo(team: TeamSnapshot) -> Any:
+            url = team.logo_url or f"https://a.espncdn.com/i/teamlogos/nba/500/{team.abbr.lower()}.png"
+            raw = http_get_bytes(url, timeout=10, retries=2)
+            logo = Image.open(io.BytesIO(raw)).convert("RGBA")
+            logo.thumbnail((148, 148), Image.Resampling.LANCZOS)
+            return logo
+
+        away_logo = fetch_logo(game.away)
+        home_logo = fetch_logo(game.home)
+
+        # Paste logos left and right
+        img.alpha_composite(away_logo, (68 + (148 - away_logo.width) // 2, 54 + (148 - away_logo.height) // 2))
+        img.alpha_composite(home_logo, (w - 68 - 148 + (148 - home_logo.width) // 2, 54 + (148 - home_logo.height) // 2))
+
+        f_score = _load_font(68, bold=True)
+        f_abbr = _load_font(28, bold=True)
+        f_rec = _load_font(18, bold=False)
+        f_badge = _load_font(22, bold=True)
+
+        # Team abbreviations & records beneath logos
+        draw.text((142, 222), game.away.abbr, fill=(248, 250, 252), font=f_abbr, anchor="mm")
+        if game.away.record:
+            draw.text((142, 252), game.away.record, fill=(148, 163, 184), font=f_rec, anchor="mm")
+
+        draw.text((w - 142, 222), game.home.abbr, fill=(248, 250, 252), font=f_abbr, anchor="mm")
+        if game.home.record:
+            draw.text((w - 142, 252), game.home.record, fill=(148, 163, 184), font=f_rec, anchor="mm")
+
+        # Center status pill
+        pill_text = status_badge.upper()
+        pill_w = max(180, len(pill_text) * 14 + 44)
+        px1, px2 = (w - pill_w) // 2, (w + pill_w) // 2
+        draw.rounded_rectangle([px1, 56, px2, 98], radius=21, fill=(220, 38, 38, 255))
+        draw.text((w // 2, 77), pill_text, fill=(255, 255, 255), font=f_badge, anchor="mm")
+
+        # Center scoreline
+        score_text = f"{game.away.score}  –  {game.home.score}"
+        draw.text((w // 2, 166), score_text, fill=(255, 255, 255), font=f_score, anchor="mm")
+
+        # Quarter-by-quarter footer strip inside card
+        ls = format_linescore_compact(game)
+        if ls:
+            draw.text((w // 2, 252), ls, fill=(203, 213, 225), font=f_rec, anchor="mm")
+
+        out = io.BytesIO()
+        img.convert("RGB").save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception as exc:
+        log.warning("Banner render failed (%s) — sending text-only.", exc)
+        return None
+
+
+def _encode_multipart(fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> tuple[bytes, str]:
+    boundary = f"----NBACrunchBoundary{uuid.uuid4().hex}"
+    parts: list[bytes] = []
+    for key, val in fields.items():
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{val}\r\n".encode("utf-8")
+        )
+    for key, (filename, content, mime) in files.items():
+        header = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"{key}\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode("utf-8")
+        parts.append(header + content + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 class GeminiSummarizer:
@@ -210,7 +374,6 @@ class GeminiSummarizer:
                 raw = self.post_fn(url, payload, {"Content-Type": "application/json", "User-Agent": USER_AGENT}, 35)
                 data = json.loads(raw.decode("utf-8"))
                 parts = data["candidates"][0]["content"]["parts"]
-                # Skip thought parts if returned separately
                 text = "".join(str(p.get("text", "")) for p in parts if not p.get("thought")).strip()
                 if text:
                     return sanitize_telegram_html(text)
@@ -266,23 +429,26 @@ class Notifier:
         self.ntfy_topic = os.getenv("NTFY_TOPIC", "").strip()
         self.ntfy_server = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
-    def send(self, title: str, body: str) -> None:
-        html_title = f"<b>{html.escape(title, quote=False)}</b>"
-        html_msg = f"{html_title}\n\n{body}".strip()
-        plain_msg = f"{title}\n\n{strip_html_tags(body)}".strip()
-        print("\n" + "=" * 60 + "\n" + plain_msg + "\n" + "=" * 60 + "\n", flush=True)
-        if self.dry_run:
-            return
-        if self.tg_token and self.tg_targets:
-            for chat_id, thread_id in self.tg_targets:
-                msg_data: dict[str, Any] = {
-                    "chat_id": chat_id,
-                    "text": html_msg,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                }
-                if thread_id is not None:
-                    msg_data["message_thread_id"] = thread_id
+    def _send_tg_text(self, chat_id: str, thread_id: int | None, html_msg: str, plain_msg: str) -> None:
+        msg_data: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": html_msg,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if thread_id is not None:
+            msg_data["message_thread_id"] = thread_id
+        try:
+            self.post_fn(
+                f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
+                json.dumps(msg_data).encode("utf-8"),
+                {"Content-Type": "application/json", "User-Agent": USER_AGENT},
+                20,
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 400:
+                msg_data.pop("parse_mode", None)
+                msg_data["text"] = plain_msg
                 try:
                     self.post_fn(
                         f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
@@ -290,25 +456,70 @@ class Notifier:
                         {"Content-Type": "application/json", "User-Agent": USER_AGENT},
                         20,
                     )
-                except urllib.error.HTTPError as exc:
-                    if exc.code == 400:
-                        # Fallback to plain text if HTML entity parsing ever fails
-                        msg_data.pop("parse_mode", None)
-                        msg_data["text"] = plain_msg
-                        try:
-                            self.post_fn(
-                                f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
-                                json.dumps(msg_data).encode("utf-8"),
-                                {"Content-Type": "application/json", "User-Agent": USER_AGENT},
-                                20,
-                            )
-                            continue
-                        except Exception as retry_exc:
-                            log.error("Telegram plain fallback failed for %s (thread=%s): %s", chat_id, thread_id, retry_exc)
-                            continue
-                    log.error("Telegram send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
-                except Exception as exc:
-                    log.error("Telegram send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
+                    return
+                except Exception as retry_exc:
+                    log.error("Telegram plain fallback failed for %s (thread=%s): %s", chat_id, thread_id, retry_exc)
+                    return
+            log.error("Telegram send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
+        except Exception as exc:
+            log.error("Telegram send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
+
+    def _send_tg_photo(self, chat_id: str, thread_id: int | None, photo_bytes: bytes, caption_html: str, caption_plain: str) -> bool:
+        fields: dict[str, str] = {"chat_id": chat_id, "caption": caption_html, "parse_mode": "HTML"}
+        if thread_id is not None:
+            fields["message_thread_id"] = str(thread_id)
+        body_bytes, content_type = _encode_multipart(fields, {"photo": ("matchup.png", photo_bytes, "image/png")})
+        try:
+            self.post_fn(
+                f"https://api.telegram.org/bot{self.tg_token}/sendPhoto",
+                body_bytes,
+                {"Content-Type": content_type, "User-Agent": USER_AGENT},
+                25,
+            )
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 400:
+                fields.pop("parse_mode", None)
+                fields["caption"] = caption_plain[:1020]
+                body_bytes, content_type = _encode_multipart(fields, {"photo": ("matchup.png", photo_bytes, "image/png")})
+                try:
+                    self.post_fn(
+                        f"https://api.telegram.org/bot{self.tg_token}/sendPhoto",
+                        body_bytes,
+                        {"Content-Type": content_type, "User-Agent": USER_AGENT},
+                        25,
+                    )
+                    return True
+                except Exception as retry_exc:
+                    log.error("Telegram photo plain fallback failed for %s (thread=%s): %s", chat_id, thread_id, retry_exc)
+                    return False
+            log.error("Telegram photo send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
+            return False
+        except Exception as exc:
+            log.error("Telegram photo send failed for %s (thread=%s): %s", chat_id, thread_id, exc)
+            return False
+
+    def send(self, title: str, body: str, photo_bytes: bytes | None = None) -> None:
+        html_title = f"<b>{html.escape(title, quote=False)}</b>"
+        html_msg = f"{html_title}\n\n{body}".strip()
+        plain_msg = f"{title}\n\n{strip_html_tags(body)}".strip()
+        banner_tag = " [+LOGO BANNER]" if photo_bytes else ""
+        print("\n" + "=" * 60 + banner_tag + "\n" + plain_msg + "\n" + "=" * 60 + "\n", flush=True)
+        if self.dry_run:
+            return
+        if self.tg_token and self.tg_targets:
+            for chat_id, thread_id in self.tg_targets:
+                if photo_bytes:
+                    if len(html_msg) <= 1020:
+                        ok = self._send_tg_photo(chat_id, thread_id, photo_bytes, html_msg, plain_msg)
+                        if not ok:
+                            self._send_tg_text(chat_id, thread_id, html_msg, plain_msg)
+                    else:
+                        # Caption exceeds Telegram's 1024-char limit: send banner + full text right below
+                        self._send_tg_photo(chat_id, thread_id, photo_bytes, html_title, title)
+                        self._send_tg_text(chat_id, thread_id, body, strip_html_tags(body))
+                else:
+                    self._send_tg_text(chat_id, thread_id, html_msg, plain_msg)
         if self.discord_url:
             try:
                 payload = json.dumps({"content": f"**{title}**\n{strip_html_tags(body)}"[:1990]}).encode("utf-8")
@@ -356,6 +567,8 @@ def parse_scoreboard(payload: dict[str, Any]) -> list[GameSnapshot]:
                 int(c.get("score", 0) or 0),
                 linescores,
                 rec_str,
+                str(t.get("logo", "")),
+                str(t.get("color", "")),
             )
             if c.get("homeAway") == "home":
                 home_team = snap
@@ -466,7 +679,18 @@ def format_linescore_compact(game: GameSnapshot) -> str:
     return f"{game.away.abbr} ({a_str} = {game.away.score}) | {game.home.abbr} ({h_str} = {game.home.score})"
 
 
-def build_crunch_intro(game: GameSnapshot, summary: dict[str, Any], summarizer: GeminiSummarizer | None = None) -> tuple[str, str, int]:
+def is_pbp_behind_scoreboard(game: GameSnapshot, summary: dict[str, Any]) -> bool:
+    """Detect ESPN sync lag where scoreboard has updated points not yet present in play-by-play."""
+    plays = summary.get("plays", [])
+    if not plays:
+        return game.away.score > 0 or game.home.score > 0
+    last = plays[-1]
+    pbp_a = int(last.get("awayScore", 0) or 0)
+    pbp_h = int(last.get("homeScore", 0) or 0)
+    return pbp_a < game.away.score or pbp_h < game.home.score
+
+
+def build_crunch_intro(game: GameSnapshot, summary: dict[str, Any], summarizer: GeminiSummarizer | None = None) -> tuple[str, str, int, bytes | None]:
     period_lbl = f"Q{game.period}" if game.period <= 4 else f"OT{game.period - 4}"
     title = f"🏀 Crunch Time ({period_lbl} {game.display_clock}) — {game.score_line()}"
     ls_compact = format_linescore_compact(game)
@@ -507,31 +731,60 @@ def build_crunch_intro(game: GameSnapshot, summary: dict[str, Any], summarizer: 
         "2. Add 3–4 crisp • bullets covering the game's momentum/comeback context, who's driving each side (notable efficiency, shooting struggles, or triple-double watches), and what happened on the most recent possessions."
     )
     body = summarizer.summarize(instruction, raw_context, fallback_body) if (summarizer and summarizer.enabled) else fallback_body
+    banner = render_matchup_banner(game, f"CRUNCH TIME · {period_lbl} {game.display_clock}")
     plays = summary.get("plays", [])
-    return title, body, int(plays[-1].get("sequenceNumber", len(plays))) if plays else 0
+    return title, body, int(plays[-1].get("sequenceNumber", len(plays))) if plays else 0, banner
 
 
-def build_minute_update(game: GameSnapshot, summary: dict[str, Any], last_seq: int, summarizer: GeminiSummarizer | None = None) -> tuple[str, str, int]:
-    plays = summary.get("plays", [])
-    new_plays, newest_seq = [], last_seq
-    for idx, p in enumerate(plays, start=1):
-        seq = int(p.get("sequenceNumber", idx) or idx)
-        if seq > last_seq:
-            new_plays.append(p)
-            newest_seq = max(newest_seq, seq)
+def build_minute_update(
+    game: GameSnapshot,
+    summary: dict[str, Any],
+    last_seq: int,
+    summarizer: GeminiSummarizer | None = None,
+    summary_fetcher: Callable[[str], dict[str, Any]] | None = None,
+    sync_retry_delay: float = 8.0,
+) -> tuple[str, str, int] | None:
+    """Build a 1-minute crunch update. Returns None if play-by-play is lagging behind a score jump."""
+    def collect(summ: dict[str, Any]) -> tuple[list[str], int]:
+        plays = summ.get("plays", [])
+        new_plays, newest = [], last_seq
+        for idx, p in enumerate(plays, start=1):
+            seq = int(p.get("sequenceNumber", idx) or idx)
+            if seq > last_seq:
+                new_plays.append(p)
+                newest = max(newest, seq)
+        hl = []
+        for p in new_plays:
+            text = str(p.get("text", "")).strip()
+            if not text:
+                continue
+            is_scoring = bool(p.get("scoringPlay"))
+            if is_scoring or any(k in text.lower() for k in ("steal", "block", "turnover", "timeout", "foul", "challenge")):
+                clock = p.get("clock", {}).get("displayValue", "")
+                score_tag = f" ({p.get('awayScore')}-{p.get('homeScore')})" if is_scoring else ""
+                hl.append(f"[{clock}] {text}{score_tag}")
+        return hl, newest
+
+    highlights, newest_seq = collect(summary)
+
+    # ESPN sync guard: if scoreboard shows new points not yet in play-by-play, wait briefly and re-fetch once
+    if is_pbp_behind_scoreboard(game, summary):
+        if summary_fetcher is not None and sync_retry_delay > 0:
+            log.info("Play-by-play lagging scoreboard for %s; retrying in %.0fs...", game.short_name, sync_retry_delay)
+            time.sleep(sync_retry_delay)
+            try:
+                summary = summary_fetcher(game.game_id)
+                highlights, newest_seq = collect(summary)
+            except Exception as exc:
+                log.warning("Sync re-fetch failed for %s: %s", game.short_name, exc)
+        if not highlights and is_pbp_behind_scoreboard(game, summary) and not game.is_final:
+            log.info("Deferring update for %s until play-by-play catches up with scoreboard.", game.short_name)
+            return None
+
     period_lbl = "FINAL" if game.is_final else (f"Q{game.period} {game.display_clock}" if game.period <= 4 else f"OT{game.period - 4} {game.display_clock}")
     prefix = "🏁 Final" if game.is_final else f"⏱ {period_lbl}"
     title = f"{prefix} — {game.score_line()}"
-    highlights = []
-    for p in new_plays:
-        text = str(p.get("text", "")).strip()
-        if not text:
-            continue
-        is_scoring = bool(p.get("scoringPlay"))
-        if is_scoring or any(k in text.lower() for k in ("steal", "block", "turnover", "timeout", "foul", "challenge")):
-            clock = p.get("clock", {}).get("displayValue", "")
-            score_tag = f" ({p.get('awayScore')}-{p.get('homeScore')})" if is_scoring else ""
-            highlights.append(f"[{clock}] {text}{score_tag}")
+
     if not highlights:
         return title, "<i>Quiet minute — timeout, stoppage, or empty trips on both ends.</i>", newest_seq
     fallback_body = "<b>Last minute:</b>\n" + "\n".join(f"• {html.escape(h)}" for h in highlights[-8:])
@@ -542,7 +795,7 @@ def build_minute_update(game: GameSnapshot, summary: dict[str, Any], last_seq: i
             for abbr in (game.away.abbr, game.home.abbr)
         )
         instruction = (
-            "Write a brisk, conversational final-buzzer wrap-up (2–3 short sentences + 2 bullets): "
+            "Write a brisk, clean final-buzzer wrap-up (2 short sentences + 2 • bullets): "
             "how the closing minute sealed it, who closed the game out, and the top stat line."
         )
         raw_context = f"Final: {game.away.name} {game.away.score}, {game.home.name} {game.home.score}\nClosing plays:\n" + "\n".join(highlights[-8:]) + f"\n\nTop performers:\n{perf_ctx}"
@@ -556,7 +809,7 @@ def build_minute_update(game: GameSnapshot, summary: dict[str, Any], last_seq: i
     return title, body, newest_seq
 
 
-def build_lakers_quarter_update(game: GameSnapshot, summary: dict[str, Any], period_done: int, summarizer: GeminiSummarizer | None = None) -> tuple[str, str]:
+def build_lakers_quarter_update(game: GameSnapshot, summary: dict[str, Any], period_done: int, summarizer: GeminiSummarizer | None = None) -> tuple[str, str, bytes | None]:
     label = "Final" if game.is_final else ("Halftime" if period_done == 2 else (f"End of Q{period_done}" if period_done <= 4 else f"End of OT{period_done - 4}"))
     title = f"💜💛 Lakers {label} — {game.score_line()}"
     ls_compact = format_linescore_compact(game)
@@ -574,7 +827,7 @@ def build_lakers_quarter_update(game: GameSnapshot, summary: dict[str, Any], per
 
     raw_context = "\n\n".join(filter(None, [
         f"Game: {game.away.name} @ {game.home.name} ({label})",
-        f"Score: {game.score_line()}",
+        f"Score: {game.score_line(with_emojis=False)}",
         f"Quarter-by-quarter: {ls_compact}" if ls_compact else "",
         "Runs / Comebacks:\n" + "\n".join(f"- {n}" for n in story_notes) if story_notes else "",
         "Top Performers:\n" + "\n".join(
@@ -583,13 +836,14 @@ def build_lakers_quarter_update(game: GameSnapshot, summary: dict[str, Any], per
         ),
     ]))
     instruction = (
-        f"Write a sharp, conversational {label} check-in for a Lakers fan:\n"
+        f"Write a sharp, clean {label} check-in for a Lakers fan:\n"
         "1. 1–2 sentences on how the Lakers look right now and the quarter's momentum.\n"
         "2. Compact <b>Quarters:</b> line.\n"
         "3. 2–3 crisp • bullets on who's carrying LA, who's hurting them on the other side, and what to watch next."
     )
     body = summarizer.summarize(instruction, raw_context, fallback_body) if (summarizer and summarizer.enabled) else fallback_body
-    return title, body
+    banner = render_matchup_banner(game, f"LAKERS · {label}")
+    return title, body, banner
 
 
 def seconds_until_wake_window(now_sgt: dt.datetime, wake_hour_sgt: int, ignore_wake_window: bool) -> float:
@@ -598,11 +852,6 @@ def seconds_until_wake_window(now_sgt: dt.datetime, wake_hour_sgt: int, ignore_w
     if now_sgt.weekday() < 5 and now_sgt.hour < wake_hour_sgt:
         return max(0.0, (now_sgt.replace(hour=wake_hour_sgt, minute=0, second=0, microsecond=0) - now_sgt).total_seconds())
     return 0.0
-
-
-# Official NBA Rule 5 intermission lengths: 15 min halftime; 2:30 local (3:30 national TV) quarter/OT breaks
-HALFTIME_SLEEP_SECONDS = 15 * 60
-QUARTER_BREAK_SLEEP_SECONDS = 150  # 2.5 minutes
 
 
 def q4_silent_watch_sleep(margin: int) -> tuple[int, str]:
@@ -661,7 +910,17 @@ def compute_next_sleep_seconds(games: list[GameSnapshot], trackers: dict[str, Ga
     return max(60, int(best_wait)), best_reason
 
 
-def process_games(games: list[GameSnapshot], trackers: dict[str, GameTracker], notifier: Notifier, close_margin: int, summary_fetcher=fetch_game_summary, summarizer: GeminiSummarizer | None = None) -> None:
+def process_games(
+    games: list[GameSnapshot],
+    trackers: dict[str, GameTracker],
+    notifier: Notifier,
+    close_margin: int,
+    summary_fetcher=fetch_game_summary,
+    summarizer: GeminiSummarizer | None = None,
+    sync_retry_delay: float = 8.0,
+) -> None:
+    minute_batch: list[tuple[str, str]] = []
+
     for g in games:
         tr = trackers.setdefault(g.game_id, GameTracker())
         summary_cache: dict[str, Any] | None = None
@@ -670,29 +929,45 @@ def process_games(games: list[GameSnapshot], trackers: dict[str, GameTracker], n
             if summary_cache is None:
                 summary_cache = summary_fetcher(g.game_id)
             return summary_cache
+
         if g.is_lakers:
             if g.is_final and not tr.lakers_final_sent:
-                notifier.send(*build_lakers_quarter_update(g, get_summary(), g.period, summarizer))
+                title, body, banner = build_lakers_quarter_update(g, get_summary(), g.period, summarizer)
+                notifier.send(title, body, photo_bytes=banner)
                 tr.lakers_final_sent = True
                 tr.last_lakers_period_sent = max(tr.last_lakers_period_sent, g.period)
             elif g.is_live:
                 completed = g.period if (g.is_end_of_period and g.period >= 1) else (g.period - 1 if g.period > 1 and (g.period - 1) > tr.last_lakers_period_sent else 0)
                 if completed > tr.last_lakers_period_sent:
-                    notifier.send(*build_lakers_quarter_update(g, get_summary(), completed, summarizer))
+                    title, body, banner = build_lakers_quarter_update(g, get_summary(), completed, summarizer)
+                    notifier.send(title, body, photo_bytes=banner)
                     tr.last_lakers_period_sent = completed
+
         if g.is_live and g.period >= 4:
             if not tr.crunch_alerted and g.margin <= close_margin:
-                title, body, last_seq = build_crunch_intro(g, get_summary(), summarizer)
-                notifier.send(title, body)
+                title, body, last_seq, banner = build_crunch_intro(g, get_summary(), summarizer)
+                notifier.send(title, body, photo_bytes=banner)
                 tr.crunch_alerted, tr.last_play_seq = True, last_seq
             elif tr.crunch_alerted:
-                title, body, newest_seq = build_minute_update(g, get_summary(), tr.last_play_seq, summarizer)
-                notifier.send(title, body)
-                tr.last_play_seq = newest_seq
+                res = build_minute_update(g, get_summary(), tr.last_play_seq, summarizer, summary_fetcher, sync_retry_delay)
+                if res is not None:
+                    title, body, newest_seq = res
+                    minute_batch.append((title, body))
+                    tr.last_play_seq = newest_seq
         elif g.is_final and tr.crunch_alerted and not tr.crunch_final_sent:
-            title, body, newest_seq = build_minute_update(g, get_summary(), tr.last_play_seq, summarizer)
-            notifier.send(title, body)
-            tr.last_play_seq, tr.crunch_final_sent = newest_seq, True
+            res = build_minute_update(g, get_summary(), tr.last_play_seq, summarizer, summary_fetcher, sync_retry_delay)
+            if res is not None:
+                title, body, newest_seq = res
+                minute_batch.append((title, body))
+                tr.last_play_seq, tr.crunch_final_sent = newest_seq, True
+
+    # Combined multi-game digest when 2+ crunch-time games tick on the same minute
+    if len(minute_batch) == 1:
+        notifier.send(minute_batch[0][0], minute_batch[0][1])
+    elif len(minute_batch) > 1:
+        digest_title = f"🏀 Crunch-Time Digest ({len(minute_batch)} Games)"
+        sections = [f"<b>{html.escape(t, quote=False)}</b>\n{b}" for t, b in minute_batch]
+        notifier.send(digest_title, "\n\n".join(sections))
 
 
 def run_watcher(args: argparse.Namespace) -> None:

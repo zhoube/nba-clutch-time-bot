@@ -38,6 +38,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Pillow for team-logo banners
+        run: pip install --quiet pillow
+
       - name: Run NBA Crunch Watcher
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
