@@ -600,6 +600,22 @@ def seconds_until_wake_window(now_sgt: dt.datetime, wake_hour_sgt: int, ignore_w
     return 0.0
 
 
+# Official NBA Rule 5 intermission lengths: 15 min halftime; 2:30 local (3:30 national TV) quarter/OT breaks
+HALFTIME_SLEEP_SECONDS = 15 * 60
+QUARTER_BREAK_SLEEP_SECONDS = 150  # 2.5 minutes
+
+
+def q4_silent_watch_sleep(margin: int) -> tuple[int, str]:
+    """Tiered silent Q4/OT polling intervals based on current point margin."""
+    if margin <= 15:
+        return 60, f"Q4 silent watch 11-15 pts (margin {margin})"
+    if margin <= 20:
+        return 120, f"Q4 silent watch 16-20 pts (margin {margin})"
+    if margin <= 30:
+        return 180, f"Q4 silent watch 21-30 pts (margin {margin})"
+    return 300, f"Q4 silent watch 31+ pts (margin {margin})"
+
+
 def compute_next_sleep_seconds(games: list[GameSnapshot], trackers: dict[str, GameTracker], now_utc: dt.datetime, close_margin: int, wake_hour_sgt: int, ignore_wake_window: bool) -> tuple[int, str]:
     if not games:
         return 0, "no_games"
@@ -614,24 +630,25 @@ def compute_next_sleep_seconds(games: list[GameSnapshot], trackers: dict[str, Ga
             continue
         tr = trackers.setdefault(g.game_id, GameTracker())
         if g.is_live and (tr.crunch_alerted or (g.period >= 4 and g.margin <= close_margin)):
+            if g.is_end_of_period:
+                candidates.append((float(QUARTER_BREAK_SLEEP_SECONDS), f"pre-OT break ({g.short_name})"))
+                continue
             return CRUNCH_POLL_SECONDS, f"crunch watch ({g.short_name})"
         if g.is_pre:
             offset = 20 * 60 if g.is_lakers else 75 * 60
             candidates.append((max(120.0, (g.start_time_utc - now_utc).total_seconds() + offset), f"waiting for {g.short_name}"))
+        elif g.is_live and g.is_halftime:
+            candidates.append((float(HALFTIME_SLEEP_SECONDS), f"halftime 15m ({g.short_name})"))
+        elif g.is_live and g.is_end_of_period:
+            candidates.append((float(QUARTER_BREAK_SLEEP_SECONDS), f"quarter break 2.5m ({g.short_name})"))
+        elif g.is_live and g.period >= 4:
+            secs, lbl = q4_silent_watch_sleep(g.margin)
+            candidates.append((float(secs), f"{lbl} ({g.short_name})"))
         elif g.is_live and g.is_lakers:
-            if g.is_halftime:
-                candidates.append((12 * 60.0, f"Lakers halftime ({g.short_name})"))
-            elif g.is_end_of_period:
-                candidates.append((180.0, f"Lakers break ({g.short_name})"))
-            else:
-                est = g.clock_seconds * 1.8
-                candidates.append((60.0 if est <= 180 else min(15 * 60.0, max(120.0, est - 150.0)), f"Lakers Q{g.period}"))
+            est = g.clock_seconds * 1.8
+            candidates.append((60.0 if est <= 180 else min(15 * 60.0, max(120.0, est - 150.0)), f"Lakers Q{g.period}"))
         elif g.is_live:
-            if g.period >= 4:
-                candidates.append((210.0, f"Q4 blowout ({g.short_name})"))
-            elif g.is_halftime:
-                candidates.append((28 * 60.0, f"halftime ({g.short_name})"))
-            elif g.period == 1:
+            if g.period == 1:
                 candidates.append((40 * 60.0, f"Q1 chill ({g.short_name})"))
             elif g.period == 2:
                 candidates.append((30 * 60.0, f"Q2 chill ({g.short_name})"))
