@@ -3,7 +3,8 @@ name: NBA Crunch Watcher
 on:
   schedule:
     # 02:00 UTC = 10:00 AM SGT daily (exits in seconds on non-game days)
-    - cron: "0 2 * * *"
+    - cron: "47 1 * * *"
+    - cron: "17 2 * * *"
   workflow_dispatch:
     inputs:
       date:
