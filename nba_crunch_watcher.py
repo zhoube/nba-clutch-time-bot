@@ -52,6 +52,7 @@ CRUNCH_POLL_SECONDS = 60
 # Official NBA Rule 5 intermission lengths: 15 min halftime; 2:30 local (3:30 national TV) quarter/OT breaks
 HALFTIME_SLEEP_SECONDS = 15 * 60
 QUARTER_BREAK_SLEEP_SECONDS = 150  # 2.5 minutes
+MAX_IDLE_WAIT_SECONDS = 4 * 3600  # Exit cleanly if no game is live and next tip is >4h away
 
 TEAM_EMOJI: dict[str, str] = {
     "ATL": "🦅", "BOS": "☘️", "BKN": "🕸️", "CHA": "🐝", "CHI": "🐂",
@@ -1160,6 +1161,8 @@ def compute_next_sleep_seconds(games: list[GameSnapshot], trackers: dict[str, Ga
     if not candidates:
         return 300, "fallback"
     best_wait, best_reason = min(candidates, key=lambda x: x[0])
+    if not any(g.is_live for g in games) and best_wait > MAX_IDLE_WAIT_SECONDS:
+        return 0, f"next_tip_too_far ({best_wait / 3600.0:.1f}h: {best_reason})"
     return max(60, int(best_wait)), best_reason
 
 
