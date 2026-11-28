@@ -159,6 +159,8 @@ class GameTracker:
     last_lakers_period_sent: int = 0
     lakers_final_sent: bool = False
     last_home_win_pct: float | None = None
+    recent_updates: list[str] = field(default_factory=list)
+    reported_foul_trouble: dict[str, int] = field(default_factory=dict)
 
 
 def http_get_bytes(url: str, timeout: int = 15, retries: int = 2) -> bytes:
@@ -359,7 +361,12 @@ class GeminiSummarizer:
             "a shooting foul + the resulting free throws = one bullet; a steal + transition bucket = one bullet).\n"
             "- NEVER restate the header score or clock as a separate filler bullet, and NEVER overuse 'momentum'—only mention momentum on an actual run, lead change, or comeback surge.\n"
             "- BANNED clichés: 'Late-game battle', 'Trailing [Team]', 'Momentum check', 'Momentum & strategy', 'execution down the stretch', 'tightly contested stretch', 'crucial stoppage'.\n"
-            "- ALWAYS call out personal foul trouble (Q1 ≥2, Q2 ≥3, Q3 ≥4, Q4/OT ≥5 PF) and team bonus situations when flagged in LIVE DATA.\n"
+            "- Call out NEW personal foul trouble (when flagged in LIVE DATA) and meaningful bonus changes, but NEVER repeat a player's 5-PF warning from an earlier update—and in the final 2 minutes of Q4/OT, 5 fouls no longer matter (only mention if someone actually fouls out with 6 PF).\n"
+            "- LATE-GAME NBA TACTICAL IQ (final 2 minutes of Q4/OT):\n"
+            "  * Timeouts: Calling a timeout after a made basket/FT or defensive rebound in the final 2 minutes advances the ball to midcourt for a cleaner inbound and sets up offense/defense subs—never blame a late timeout or sub on 5-foul trouble.\n"
+            "  * Intentional fouls: Trailing teams intentionally foul in the final ~30s to stop the clock; teams up 3 (or up 2 with seconds left) may foul intentionally to prevent a game-tying three. Don't re-announce that a team is already in the bonus on every intentional foul.\n"
+            "  * Intentional missed 2nd FT: If a trailing team is down 2 (or 3) with ≤8 seconds left, makes the 1st FT, and misses the 2nd FT, recognize it as a deliberate tactical miss to chase an offensive rebound/putback—never frame it as a normal miss or choke.\n"
+            "  * Continuity: Check 'Previous Updates Sent' in LIVE DATA. Do NOT repeat plays already reported, and DO account for every point scored since the previous update (including the 2nd FT of a free-throw trip that was split across updates).\n"
             "- Use ONLY facts from LIVE DATA (pay strict attention to [TEAM] tags and lead margin—never mix up which team scored or miscount possessions).\n"
             "- Format cleanly for Telegram using ONLY <b>bold</b>, <i>italic</i>, <code>code</code>, and • bullets. Use consistent <b>bold</b> lead-ins (no random italics for labels). No Markdown (** or #).\n\n"
             "GOOD EXAMPLES OF STYLE:\n"
@@ -672,8 +679,16 @@ def foul_trouble_threshold(period: int) -> int:
     return 5
 
 
-def extract_foul_trouble(game: GameSnapshot, summary: dict[str, Any]) -> list[str]:
-    thresh = foul_trouble_threshold(game.period)
+def extract_foul_trouble(
+    game: GameSnapshot,
+    summary: dict[str, Any],
+    reported_pf: dict[str, int] | None = None,
+) -> list[str]:
+    # In the final 2 minutes of Q4/OT, 5 fouls don't matter—only report actual foul-outs (6 PF).
+    if game.period >= 4 and game.clock_seconds <= 120.0:
+        thresh = 6
+    else:
+        thresh = foul_trouble_threshold(game.period)
     alerts: list[str] = []
     for group in summary.get("boxscore", {}).get("players", []):
         abbr = group.get("team", {}).get("abbreviation", "???")
@@ -696,6 +711,11 @@ def extract_foul_trouble(game: GameSnapshot, summary: dict[str, Any]) -> list[st
                 continue
             if pf >= thresh:
                 name = entry.get("athlete", {}).get("displayName") or entry.get("athlete", {}).get("shortName", "Player")
+                key = f"{abbr}:{name}"
+                if reported_pf is not None:
+                    if reported_pf.get(key, 0) >= pf:
+                        continue
+                    reported_pf[key] = pf
                 note = "FOULED OUT (6 PF)" if pf >= 6 else (f"{pf} PF — 1 away from fouling out" if pf == 5 else f"{pf} PF in Q{game.period}")
                 alerts.append(f"[{abbr}] {name}: {note}")
     return alerts
@@ -982,6 +1002,8 @@ def build_minute_update(
     summarizer: GeminiSummarizer | None = None,
     summary_fetcher: Callable[[str], dict[str, Any]] | None = None,
     sync_retry_delay: float = 8.0,
+    recent_updates: list[str] | None = None,
+    reported_foul_trouble: dict[str, int] | None = None,
 ) -> tuple[str, str, int, float | None] | None:
     """Build a 1-minute crunch update using ALL new plays. Returns None if PBP lags a score jump."""
     def collect_all_plays(summ: dict[str, Any]) -> tuple[list[str], int]:
@@ -1024,7 +1046,7 @@ def build_minute_update(
         body = f"{wp_html}\n{quiet}" if wp_html else quiet
         return title, body, newest_seq, home_wp
 
-    foul_trouble = extract_foul_trouble(game, summary)
+    foul_trouble = extract_foul_trouble(game, summary, reported_pf=reported_foul_trouble)
     team_fouls = compute_team_fouls_status(game, summary)
 
     fallback_lines = [wp_html] if wp_html else []
@@ -1032,18 +1054,23 @@ def build_minute_update(
     fallback_lines.extend(f"• {html.escape(h)}" for h in all_new_plays[-10:])
     fallback_body = "\n".join(fallback_lines)
 
+    prev_ctx = ""
+    if recent_updates:
+        prev_ctx = "Previous Updates Sent (for continuity — do NOT repeat already-reported plays, and DO account for every point/FT scored since the last score):\n" + "\n---\n".join(recent_updates[-2:])
+
     raw_context = "\n\n".join(filter(None, [
         f"Current State: {game.lead_summary()} ({period_lbl})",
         wp_banner,
         team_fouls,
-        ("Personal Foul Trouble:\n" + "\n".join(f"- {f}" for f in foul_trouble)) if foul_trouble else "",
+        ("New Personal Foul Trouble:\n" + "\n".join(f"- {f}" for f in foul_trouble)) if foul_trouble else "",
+        prev_ctx,
         "Complete Play Sequence in Last Minute (chronological):\n" + "\n".join(all_new_plays[-15:]),
     ]))
     instruction = (
         "Tell the story of what happened in the last minute in 1–3 crisp • bullets (do NOT include the win-prob line or restate the header score/clock):\n"
-        "- Cover the actual flow (made/missed shots, missed free throws, And-1s, rebounds, fouls, turnovers, timeouts).\n"
+        "- Cover the actual flow (made/missed shots, EVERY free throw including any 2nd FT from a prior trip, And-1s, rebounds, tactical misses, intentional fouls, turnovers, timeouts).\n"
         "- Merge linked plays (And-1 + foul, foul + FTs, steal + bucket) into a single bullet.\n"
-        "- Call out foul trouble (5+ PF in Q4) or a team entering/in the bonus if triggered during this minute."
+        "- Apply late-game NBA tactical IQ (midcourt timeout advances, intentional fouls, tactical 2nd-FT misses down 2/3 with seconds left). Only mention foul trouble if newly flagged in LIVE DATA."
     )
     ai_body = summarizer.summarize(instruction, raw_context, "", max_tokens=450) if (summarizer and summarizer.enabled) else ""
     if ai_body:
@@ -1216,17 +1243,34 @@ def process_games(
         if g.is_live and g.period >= 4:
             if g.margin <= close_margin:
                 if not tr.crunch_alerted:
-                    title, body, last_seq, banner, home_wp = build_crunch_intro(g, get_summary(), summarizer)
+                    summ = get_summary()
+                    title, body, last_seq, banner, home_wp = build_crunch_intro(g, summ, summarizer)
                     notifier.send(title, body, photo_bytes=banner)
                     tr.crunch_alerted, tr.last_play_seq, tr.last_home_win_pct = True, last_seq, home_wp
+                    # Seed reported foul trouble & rolling context from intro so we don't repeat them next minute
+                    extract_foul_trouble(g, summ, reported_pf=tr.reported_foul_trouble)
+                    tr.recent_updates.append(f"{strip_html_tags(title)}\n{strip_html_tags(body)}")
+                    tr.recent_updates = tr.recent_updates[-2:]
                 else:
-                    res = build_minute_update(g, get_summary(), tr.last_play_seq, tr.last_home_win_pct, summarizer, summary_fetcher, sync_retry_delay)
+                    res = build_minute_update(
+                        g,
+                        get_summary(),
+                        tr.last_play_seq,
+                        tr.last_home_win_pct,
+                        summarizer,
+                        summary_fetcher,
+                        sync_retry_delay,
+                        recent_updates=tr.recent_updates,
+                        reported_foul_trouble=tr.reported_foul_trouble,
+                    )
                     if res is not None:
                         title, body, newest_seq, home_wp = res
                         minute_batch.append((title, body))
                         tr.last_play_seq = newest_seq
                         if home_wp is not None:
                             tr.last_home_win_pct = home_wp
+                        tr.recent_updates.append(f"{strip_html_tags(title)}\n{strip_html_tags(body)}")
+                        tr.recent_updates = tr.recent_updates[-2:]
             elif tr.crunch_alerted:
                 log.info("Pausing minute updates for %s (margin %d > %d); silent Q4 watch.", g.short_name, g.margin, close_margin)
         elif g.is_final and tr.crunch_alerted and not tr.crunch_final_sent:
