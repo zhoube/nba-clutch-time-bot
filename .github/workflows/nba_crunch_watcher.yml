@@ -2,10 +2,16 @@ name: NBA Crunch Watcher
 
 on:
   schedule:
-    # Early-slate window: 21:47 UTC = 05:47 AM SGT daily (catches 6:00 AM - 11:00 AM SGT tips)
+    # Early-slate primary: 21:47 UTC = 05:47 AM SGT daily
     - cron: "47 21 * * *"
-    # Late-slate handoff: 03:17 UTC = 11:17 AM SGT daily (picks up West Coast tips & OT after early job timeout)
+    # Early-slate backup: 23:17 UTC = 07:17 AM SGT daily (covers dropped 5:47 AM cron)
+    - cron: "17 23 * * *"
+    # Mid-slate backup: 00:47 UTC = 08:47 AM SGT daily
+    - cron: "47 0 * * *"
+    # Late-slate handoff: 03:17 UTC = 11:17 AM SGT daily (West Coast tips & OT)
     - cron: "17 3 * * *"
+    # Late-slate backup: 04:47 UTC = 12:47 PM SGT daily
+    - cron: "47 4 * * *"
     # Weekend US matinee window: 17:17 UTC Sat/Sun = 01:17 AM SGT Sun/Mon
     - cron: "17 17 * * 6,0"
   workflow_dispatch:
