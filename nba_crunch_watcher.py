@@ -1132,7 +1132,7 @@ def compute_next_sleep_seconds(games: list[GameSnapshot], trackers: dict[str, Ga
         if g.is_final:
             continue
         tr = trackers.setdefault(g.game_id, GameTracker())
-        if g.is_live and (tr.crunch_alerted or (g.period >= 4 and g.margin <= close_margin)):
+        if g.is_live and g.period >= 4 and g.margin <= close_margin:
             if g.is_end_of_period:
                 candidates.append((float(QUARTER_BREAK_SLEEP_SECONDS), f"pre-OT break ({g.short_name})"))
                 continue
@@ -1200,18 +1200,21 @@ def process_games(
                     tr.last_lakers_period_sent = completed
 
         if g.is_live and g.period >= 4:
-            if not tr.crunch_alerted and g.margin <= close_margin:
-                title, body, last_seq, banner, home_wp = build_crunch_intro(g, get_summary(), summarizer)
-                notifier.send(title, body, photo_bytes=banner)
-                tr.crunch_alerted, tr.last_play_seq, tr.last_home_win_pct = True, last_seq, home_wp
+            if g.margin <= close_margin:
+                if not tr.crunch_alerted:
+                    title, body, last_seq, banner, home_wp = build_crunch_intro(g, get_summary(), summarizer)
+                    notifier.send(title, body, photo_bytes=banner)
+                    tr.crunch_alerted, tr.last_play_seq, tr.last_home_win_pct = True, last_seq, home_wp
+                else:
+                    res = build_minute_update(g, get_summary(), tr.last_play_seq, tr.last_home_win_pct, summarizer, summary_fetcher, sync_retry_delay)
+                    if res is not None:
+                        title, body, newest_seq, home_wp = res
+                        minute_batch.append((title, body))
+                        tr.last_play_seq = newest_seq
+                        if home_wp is not None:
+                            tr.last_home_win_pct = home_wp
             elif tr.crunch_alerted:
-                res = build_minute_update(g, get_summary(), tr.last_play_seq, tr.last_home_win_pct, summarizer, summary_fetcher, sync_retry_delay)
-                if res is not None:
-                    title, body, newest_seq, home_wp = res
-                    minute_batch.append((title, body))
-                    tr.last_play_seq = newest_seq
-                    if home_wp is not None:
-                        tr.last_home_win_pct = home_wp
+                log.info("Pausing minute updates for %s (margin %d > %d); silent Q4 watch.", g.short_name, g.margin, close_margin)
         elif g.is_final and tr.crunch_alerted and not tr.crunch_final_sent:
             title, body, newest_seq, banner = build_final_recap(g, get_summary(), tr.last_play_seq, summarizer)
             notifier.send(title, body, photo_bytes=banner)
