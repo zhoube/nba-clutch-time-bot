@@ -1193,7 +1193,21 @@ def process_games(
                 tr.lakers_final_sent = True
                 tr.last_lakers_period_sent = max(tr.last_lakers_period_sent, g.period)
             elif g.is_live:
-                completed = g.period if (g.is_end_of_period and g.period >= 1) else (g.period - 1 if g.period > 1 and (g.period - 1) > tr.last_lakers_period_sent else 0)
+                completed = 0
+                if g.is_end_of_period and g.period >= 1:
+                    completed = g.period
+                elif g.period > 1 and (g.period - 1) > tr.last_lakers_period_sent:
+                    # Only catch up a just-ended quarter within the first 2 min of the next period;
+                    # if starting mid/late quarter (e.g. 1 min left in Q2), skip the stale Q1 alert.
+                    fresh_clock_floor = 180.0 if g.period >= 5 else 600.0
+                    if g.clock_seconds >= fresh_clock_floor:
+                        completed = g.period - 1
+                    else:
+                        log.info(
+                            "Skipping stale Lakers End of Q%d alert (currently Q%d %s); waiting for next horn.",
+                            g.period - 1, g.period, g.display_clock,
+                        )
+                        tr.last_lakers_period_sent = g.period - 1
                 if completed > tr.last_lakers_period_sent:
                     title, body, banner = build_lakers_quarter_update(g, get_summary(), completed, summarizer)
                     notifier.send(title, body, photo_bytes=banner)
